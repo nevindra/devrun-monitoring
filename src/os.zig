@@ -142,6 +142,24 @@ pub fn getcwd(buf: []u8) ?[]const u8 {
     return buf[0 .. n - 1];
 }
 
+/// The path of the running executable, or null when it cannot be read.
+///
+/// `readlink` does not NUL-terminate and reports a truncated read as a short
+/// one rather than an error, so a result that exactly fills the buffer is
+/// treated as a failure — a silently clipped path is worse than none, since
+/// the one caller uses it to decide where to write a new binary.
+///
+/// A binary whose file has been unlinked reads back as "…/devrun (deleted)".
+/// That is left alone rather than trimmed: the suffix is indistinguishable
+/// from a real filename, and guessing wrong means writing to the wrong path.
+pub fn selfExe(buf: []u8) ?[]const u8 {
+    const rc = linux.readlink("/proc/self/exe", buf.ptr, buf.len);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    const n = @as(usize, rc);
+    if (n == 0 or n == buf.len) return null;
+    return buf[0..n];
+}
+
 /// `mkdir -p`. Creates each component in turn and treats "already there" as
 /// success, which is the only outcome a caller distinguishes.
 pub fn makePath(path: []const u8) !void {

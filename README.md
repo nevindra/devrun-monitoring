@@ -3,8 +3,7 @@
 A process runner for local development whose logs you can actually get out of it.
 
 > **Status: working.** Spawns, supervises, archives, probes, and draws.
-> See [Roadmap](#roadmap) for what is done. Linux only, Zig 0.16, no
-> dependencies to fetch.
+> Linux only, Zig 0.16, no dependencies to fetch.
 
 ## Why
 
@@ -32,6 +31,32 @@ no WebSocket framing, no per-client subscriptions, no backpressure handling. And
 because the in-memory window is a bounded cache rather than the record, scrolling
 past it reads from the page cache: RAM speed, without counting toward RSS.
 
+## Install
+
+```console
+$ curl -fsSL https://raw.githubusercontent.com/nevindra/devrun-monitoring/main/install.sh | sh
+```
+
+Static x86_64 and aarch64 binaries, checked against the release's `SHA256SUMS`
+before anything is written and renamed into place rather than written over.
+Lands in `~/.local/bin`; `DEVRUN_INSTALL_DIR` overrides.
+
+```console
+$ devrun update              # replace this binary with the latest release
+$ devrun version
+```
+
+`devrun update` runs that same script rather than reimplementing it, and
+replaces whichever binary you invoked — a build in `~/src` and a release in
+`~/.local/bin` do not overwrite each other.
+
+**From source** — requires [Zig 0.16.0](https://ziglang.org/download/#release-0.16.0):
+
+```console
+$ zig build && zig build test
+$ ./zig-out/bin/devrun up
+```
+
 ## What it does
 
 **Runs the processes.** Reads your existing `process-compose.yaml`. Dependency
@@ -39,11 +64,9 @@ graph with all five `depends_on` conditions, readiness probes over `exec` and
 `http_get`, the four restart policies, and a shutdown ladder that honours the
 signal and grace period the file asks for.
 
-**Keeps the logs.** Every process writes to `.devrun/logs/<name>.log` from the
-moment it spawns — a plain file, byte-faithful, ANSI intact. `tail -f`, `grep`,
-`less` and your editor work on it while the Session is running. The TUI is a
-view over those files, not their owner, and scrollback goes to the start of the
-run rather than to the end of a buffer.
+**Keeps the logs.** `.devrun/logs/<name>.log` is a plain file, byte-faithful,
+ANSI intact, being appended to while the Session runs. Scrollback goes to the
+start of the run rather than to the end of a buffer.
 
 **Gets lines out.** Drag across the log to pick lines, `y` to copy. Copy goes
 over OSC 52, so it lands on the clipboard of the machine you are sitting at,
@@ -54,23 +77,29 @@ the whole process tree — the CPU figure counts children already reaped, and th
 memory figure is PSS so a tree's total is not the same page counted five times.
 
 **Stays out of the way.** One static binary, no runtime, no daemon left behind,
-no second config file in your repo. Piped or redirected it prints prefixed
-lines instead of drawing, so `devrun up | tee build.log` and CI both work.
+no second config file in your repo.
+
+```console
+$ devrun up                    # TUI
+$ devrun up --plain            # prefixed lines, no terminal control
+$ devrun up --window-bytes 8M  # a larger in-memory cache; the log is unaffected
+$ devrun config                # what devrun understood from the file
+$ devrun logs api              # prints the Archive's path — the log is a file
+$ devrun status                # ask a running Session what it is doing
+$ devrun samples               # per-process CPU, memory, disk I/O
+$ devrun restart api           # act on one Worker without stopping the rest
+```
+
+Piped or redirected, `up` prints prefixed lines instead of drawing, so
+`devrun up | tee build.log` and CI both work.
 
 ## Coexistence
 
-devrun reads your existing `process-compose.yaml`. No second config file, nothing
-to keep in sync:
-
-```console
-$ process-compose up     # your teammate
-$ devrun up              # you
-```
-
-It supports a strict subset of the schema and **refuses any field it does not
-understand** rather than ignoring it. That refusal is deliberate: a silently
-skipped field is how two people run the same file and get different behaviour
-with nothing on screen to say why.
+devrun reads your existing `process-compose.yaml` — no second config file,
+nothing to keep in sync. It supports a strict subset of the schema and
+**refuses any field it does not understand** rather than ignoring it. That
+refusal is deliberate: a silently skipped field is how two people run the same
+file and get different behaviour with nothing on screen to say why.
 
 ```console
 $ devrun config
@@ -78,8 +107,6 @@ devrun: processes.go: unsupported field "log_location". devrun reads a subset of
 process-compose's schema and refuses fields it would otherwise ignore, so that
 both tools read this file the same way.
 ```
-
-### Supported subset
 
 | | |
 |---|---|
@@ -94,51 +121,21 @@ both tools read this file the same way.
 `${VAR}` and `$VAR` expand over the raw file *before* YAML parsing, with `.env`
 values taking precedence over the OS environment and unset names becoming empty
 — matching process-compose exactly. Shell parameter expansion (`${VAR:-default}`)
-is rejected, as it is there.
-
-Omitted fields take process-compose's defaults, not zero: probes default to
-`period_seconds: 10`, `timeout_seconds: 1`, `failure_threshold: 3`,
-`http_get` defaults to `127.0.0.1`, `http`, `/`, and `shutdown` defaults to
-SIGTERM with a 10-second grace.
+is rejected, as it is there. Omitted fields take process-compose's defaults, not
+zero: probes default to `period_seconds: 10`, `timeout_seconds: 1`,
+`failure_threshold: 3`, and `shutdown` to SIGTERM with a 10-second grace.
 
 A config is also refused when its graph could never resolve — a `depends_on`
 cycle, a `process_healthy` wait on a process with no probe, or a
-`process_log_ready` wait on one with no `ready_log_line`. Each of those would
-otherwise hang the Session with nothing on screen to say why.
+`process_log_ready` wait on one with no `ready_log_line`. Each would otherwise
+hang the Session with nothing on screen to say why.
 
 Two limits are ours rather than process-compose's: `readiness_probe.http_get`
 speaks plain HTTP only (`scheme: https` is refused, not silently downgraded)
 and its `host` must be an IP literal or `localhost`, because a name lookup in
 the event loop is a blocking call wearing a disguise.
 
-## Try it
-
-Requires [Zig 0.16.0](https://ziglang.org/download/#release-0.16.0).
-
-```console
-$ zig build
-$ zig build test
-$ ./zig-out/bin/devrun up
-```
-
-`devrun up` starts everything and draws the TUI. Piped or redirected, it prints
-prefixed lines instead, so `devrun up | tee build.log` and CI both work.
-
-```console
-$ devrun up                  # TUI
-$ devrun up --plain          # prefixed lines, no terminal control
-$ devrun up --window-bytes 8M  # a larger in-memory cache; the log is unaffected
-$ devrun config              # what devrun understood from the file
-$ devrun logs api            # prints the Archive's path — the log is a file
-$ devrun status              # ask a running Session what it is doing
-$ devrun samples             # per-process CPU, memory, disk I/O
-$ devrun restart api         # act on one Worker without stopping the rest
-```
-
-`devrun config` parses a file and prints what devrun understood from it — useful
-on its own for checking that a config says what you think it says.
-
-### In the TUI
+## In the TUI
 
 The view is built around the three things people actually open it for: read a
 log, take lines out of it, and see which process is working.
@@ -160,19 +157,6 @@ log, take lines out of it, and see which process is working.
    ↑ picked lines
 ```
 
-The log gets the full width because that is what it is for — a JSON line or a
-stack trace is long, and the columns a list of names was holding onto were
-columns the content needed.
-
-**Drag across the log** to pick the lines you want, then `y` to copy them. With
-nothing picked, `y` takes what is on screen. Click a process to switch to it,
-and roll the wheel to scroll. `?` lists everything.
-
-The box title over the log is the path it is being written to, standing there
-the whole time rather than waiting to be asked for — "can you send me this?" is
-answered by a filename, and that should not be something you have to know to
-look up.
-
 | | |
 |---|---|
 | drag, or `v` then `↑` / `↓` | pick lines |
@@ -185,54 +169,40 @@ look up.
 | `?` | every key, spelled out |
 | `q` | shut the Session down; again to leave immediately |
 
-The CPU column is a figure and a **meter** in one cell: the number answers "how
-much", and the block beside it answers "which of these", which is the question
-you actually have when reading down a column of them.
-
-That number counts the processes a Worker has already buried, not just the ones
-alive at the instant it was sampled. A Worker that forks per unit of work —
-`make`, `tsc`, a test runner — used to report 0% while pinning a core, because
-most of its children were born and reaped between two ticks. See
-[ADR 0004](docs/adr/0004-portability-posture.md#amendment-cpu-is-read-per-pid-and-no-longer-through-the-accumulator).
-
-**Memory is the whole tree, not the process you launched**, which is why the
-figures here are larger than other runners report — often by a lot. A service
-started through `uv`, `npm` or a shell wrapper puts almost nothing in that
-first process; a tool that reports only its RSS is showing you the launcher.
-`PROC` says how many processes the figure covers, and the line under the table
-names the largest of them, so a total can be checked rather than believed.
-
-It is PSS rather than summed RSS, because summing RSS counts every page shared
-between a parent and its forks once per process — four processes sharing 300 MB
-came to 1.3 GB that way. PSS is read for a few processes per tick rather than
-all of them every tick: it is 390× dearer than the CPU read, and memory moves
-slowly enough that a few seconds of lag costs a reader nothing. See
-[ADR 0004](docs/adr/0004-portability-posture.md#amendment-memory-is-pss-read-on-a-rotation).
-
-Every state is said three ways at once: a shape, a word, and a colour. None of
-the three has to be the one that works, which is what keeps the view readable
-in a mono terminal, in a pasted screenshot, and to a reader who cannot separate
-two of the colours.
+The log gets the full width because that is what it is for — a JSON line or a
+stack trace is long. The box title over it is the path it is being written to,
+standing there the whole time rather than waiting to be asked for: "can you send
+me this?" is answered by a filename, and that should not be something you have
+to know to look up.
 
 Because the mouse is being tracked, your terminal's own text selection needs
 **Shift** held down. devrun's copy is the better tool for it anyway: it takes
 whole lines, never the borders or the table above, and reaches the real
 clipboard.
 
-Copy uses OSC 52, so it arrives on the clipboard of the machine you are sitting
-at, through SSH and tmux. An Excerpt goes out as **plain text** — the Archive
-stays byte-faithful with its ANSI intact, and `less` and `grep` still see every
-escape, but a clipboard has no colours to put them in and `ESC[31m` in front of
-a stack trace is four characters of litter in a chat window.
+**The CPU column is a figure and a meter in one cell** — the number answers "how
+much", the block beside it answers "which of these". That number counts the
+processes a Worker has already buried, so a Worker that forks per unit of work
+(`make`, `tsc`, a test runner) no longer reports 0% while pinning a core.
 
-Scrolling back past the in-memory Window reads the Archive with `pread`, which
-for anything written this Session is the page cache — so the scrollback is the
-whole run, not the last few megabytes.
+**Memory is the whole tree, not the process you launched**, which is why these
+figures run larger than other runners report. A service started through `uv`,
+`npm` or a shell wrapper puts almost nothing in that first process; a tool
+reporting only its RSS is showing you the launcher. `PROC` says how many
+processes the figure covers and the line under the table names the largest, so
+a total can be checked rather than believed. It is PSS rather than summed RSS,
+because summing counts every shared page once per process — four processes
+sharing 300 MB came to 1.3 GB that way.
 
-That fallback is why the Window is only a megabyte. It is a cache in front of
-the file, not the record, and a page-cache read runs at the speed of the memcpy
-it replaces — so a bigger Window buys nothing you can measure and costs RSS on
-exactly the Worker that is noisiest. `--window-bytes` is there if you disagree.
+Every state is said three ways at once: a shape, a word, and a colour. None of
+the three has to be the one that works, which is what keeps the view readable in
+a mono terminal, in a pasted screenshot, and to a reader who cannot separate two
+of the colours.
+
+Both of those sampling decisions are written up in
+[ADR 0004](docs/adr/0004-portability-posture.md) — CPU is read per-pid, and PSS
+is read on a rotation because it is 390× dearer than the CPU read and memory
+moves slowly enough that a few seconds of lag costs a reader nothing.
 
 ## Measured against process-compose
 
@@ -255,10 +225,8 @@ process-compose v1.116.0, devrun at `ReleaseFast`, Linux 7.0, 16 cores.
 
 The firehose is one service writing ~80 KB/s of JSON-ish log lines while three
 sit idle. Over that run devrun put **3.1 MB of log on disk in 40 seconds while
-holding 1.2 MB resident, and the figure never moved** — which is the design
-claim rather than a coincidence: the Window is a fixed cache and the Archive is
-the file. An idle Session is where the gap is widest, and an idle Session is
-what a dev machine has open all afternoon.
+holding 1.2 MB resident, and the figure never moved** — the design claim rather
+than a coincidence: the Window is a fixed cache and the Archive is the file.
 
 **One number goes the other way, and it is worth knowing.** Under the firehose
 devrun writes ~510 KB/s to the terminal against process-compose's 27 KB/s. It
@@ -267,33 +235,20 @@ repaints on a fixed slower cadence. That is a deliberate trade — the log on
 screen is current — but on a thin SSH link it is bandwidth you are spending.
 
 Read the rest of the table with the scope in mind. process-compose is
-cross-platform, has a REST API, a far larger config surface, and years of
-edge cases devrun has not met yet. devrun reads a strict subset of one file on
-one OS. It should be cheaper; the point of measuring was to check that it
-actually is, and by how much.
-
-To repeat any of this: the harness is a `pty.fork`, a fixed `TIOCSWINSZ`, and
-`/proc/<pid>/stat` sampled at both ends of the window.
-
-## Roadmap
-
-| | | |
-|---|---|---|
-| 1 | Config — parse, expand, validate | **done** |
-| 2 | Spawn, process groups, shutdown ladder | **done** |
-| 3 | Log archive on disk + bounded memory window | **done** |
-| 4 | State machine, dependency graph, readiness probes | **done** |
-| 5 | Control socket | **done** |
-| 6 | TUI | **done** |
-| 7 | Copy and export — visual select, OSC 52 | **done** |
-| 8 | Per-process CPU, memory, disk I/O | **done** |
-
-Not done, and deliberately: log search in the TUI, `liveness_probe`, and
-anything that would put a second config file in the repo.
+cross-platform, has a REST API, a far larger config surface, and years of edge
+cases devrun has not met yet. devrun reads a strict subset of one file on one
+OS. It should be cheaper; the point of measuring was to check that it actually
+is, and by how much. To repeat any of this: the harness is a `pty.fork`, a fixed
+`TIOCSWINSZ`, and `/proc/<pid>/stat` sampled at both ends of the window.
 
 ## Design decisions
 
-The non-obvious choices are written down, with the reasoning that produced them:
+Everything in the original plan is done — config, spawn and shutdown ladder,
+Archive and Window, state machine and probes, control socket, TUI, copy, and
+per-process sampling. Not done, and deliberately: log search in the TUI,
+`liveness_probe`, and anything that would put a second config file in the repo.
+
+The non-obvious choices are written down with the reasoning that produced them:
 
 - [Logs travel through the filesystem, not the control socket](docs/adr/0001-logs-through-the-filesystem.md)
 - [Read process-compose.yaml rather than defining our own format](docs/adr/0002-read-process-compose-yaml.md)

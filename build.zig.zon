@@ -1,6 +1,6 @@
 .{
     .name = .devrun_monitoring,
-    .version = "0.1.0-dev",
+    .version = "0.1.0",
     .fingerprint = 0x71860e13afae6b5e, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},

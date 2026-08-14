@@ -9,6 +9,7 @@ const control = @import("control.zig");
 const tui = @import("tui.zig");
 const term = @import("term.zig");
 const sample = @import("sample.zig");
+const update = @import("update.zig");
 
 /// The vendored YAML parser logs every token it sees at `.debug`, which in a
 /// Debug build buries anything we print. Its warnings are still worth having.
@@ -31,6 +32,8 @@ const usage =
     \\  devrun status [-f FILE]         Ask a running Session what it is doing
     \\  devrun samples [-f FILE]        Per-process CPU, memory, and disk I/O
     \\  devrun start|stop|restart NAME  Act on one Worker of a running Session
+    \\  devrun update                   Replace this binary with the latest release
+    \\  devrun version                  Print the version and exit
     \\
     \\Options:
     \\  -f FILE            Config to read (default: process-compose.yaml)
@@ -87,6 +90,10 @@ pub fn main(init: std.process.Init) !u8 {
             return 2;
         }
         return cli.logs(out, rest[0]);
+    }
+    if (std.mem.eql(u8, cmd, "update")) return update.run(gpa, io, init.environ_map, out);
+    if (std.mem.eql(u8, cmd, "version") or std.mem.eql(u8, cmd, "--version")) {
+        return update.printVersion(out);
     }
     if (std.mem.eql(u8, cmd, "status")) return cli.ask(out, "status", null);
     if (std.mem.eql(u8, cmd, "samples")) return cli.ask(out, "samples", null);
@@ -438,4 +445,5 @@ test {
     _ = tui;
     _ = term;
     _ = sample;
+    _ = update;
 }

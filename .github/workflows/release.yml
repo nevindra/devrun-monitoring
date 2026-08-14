@@ -1,0 +1,98 @@
+# Builds the binaries a `curl | sh` install pulls down.
+#
+# Push a tag to cut a release:
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# Both targets are musl, which for a program that never links libc means the
+# artifact is a genuinely static ELF — it runs on whatever glibc the machine
+# has, including none.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build, without the leading v (e.g. 0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Resolve version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            version="${{ inputs.version }}"
+          else
+            version="${GITHUB_REF_NAME}"
+          fi
+          echo "VERSION=${version#v}" >> "$GITHUB_ENV"
+
+      # Before anything is built, let alone published. Tests run at Debug, so
+      # this is the bounds and overflow checks the release binary drops.
+      - name: Test
+        run: zig build test
+
+      - name: Build
+        run: |
+          mkdir -p dist
+          for target in x86_64-linux-musl aarch64-linux-musl; do
+            arch="${target%%-*}"
+            zig build \
+              -Dtarget="$target" \
+              -Doptimize=ReleaseFast \
+              -Dversion="$VERSION" \
+              --prefix "build/$arch"
+
+            stage="stage/$arch"
+            mkdir -p "$stage"
+            cp "build/$arch/bin/devrun" "$stage/devrun"
+            cp LICENSE README.md "$stage/"
+            tar -czf "dist/devrun-$VERSION-$arch-linux.tar.gz" -C "$stage" devrun LICENSE README.md
+          done
+
+      # The runner is x86_64, so one of the two artifacts can actually be run.
+      # This catches a -Dversion that never reached the binary, which would
+      # otherwise surface as `devrun update` looping forever on a machine that
+      # is already current.
+      - name: Smoke test
+        run: |
+          tar -xzf "dist/devrun-$VERSION-x86_64-linux.tar.gz" -C "$RUNNER_TEMP"
+          got=$("$RUNNER_TEMP/devrun" version)
+          test "$got" = "$VERSION" || {
+            echo "binary reports \"$got\", expected \"$VERSION\"" >&2
+            exit 1
+          }
+          file "$RUNNER_TEMP/devrun" | grep -q "statically linked" || {
+            echo "binary is not statically linked" >&2
+            exit 1
+          }
+
+      # Written from inside dist/ so the names in the file are bare basenames,
+      # which is what install.sh looks for and what `sha256sum -c` expects.
+      - name: Checksums
+        run: cd dist && sha256sum devrun-*.tar.gz > SHA256SUMS && cat SHA256SUMS
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            gh release upload "v$VERSION" dist/* --clobber
+          else
+            gh release create "v$VERSION" dist/* \
+              --title "devrun $VERSION" \
+              --generate-notes
+          fi

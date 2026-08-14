@@ -19,6 +19,19 @@ pub fn build(b: *std.Build) void {
     const strip = b.option(bool, "strip", "Strip debug info from the binary") orelse
         (optimize != .Debug);
 
+    // Baked in rather than read at runtime, because `devrun update` compares it
+    // against the latest release tag and a binary that cannot say what it is
+    // cannot decide whether it needs replacing. The default comes from
+    // build.zig.zon so there is one place to bump; the release workflow passes
+    // -Dversion explicitly so a tag and its artifact can never disagree.
+    const version = b.option(
+        []const u8,
+        "version",
+        "Version baked into the binary (default: the one in build.zig.zon)",
+    ) orelse @import("build.zig.zon").version;
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", version);
+
     // Vendored rather than fetched: zig-yaml's own build.zig does not compile
     // on Zig 0.16. See src/vendor/yaml/PROVENANCE.md.
     const yaml = b.createModule(.{
@@ -34,6 +47,7 @@ pub fn build(b: *std.Build) void {
         .strip = strip,
     });
     mod.addImport("yaml", yaml);
+    mod.addOptions("build_options", build_options);
 
     const exe = b.addExecutable(.{
         .name = "devrun",
@@ -60,6 +74,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .Debug,
     });
     test_mod.addImport("yaml", test_yaml);
+    test_mod.addOptions("build_options", build_options);
 
     const tests = b.addTest(.{ .root_module = test_mod });
     const run_tests = b.addRunArtifact(tests);
