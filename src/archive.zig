@@ -15,8 +15,8 @@
 //! There is deliberately no line index. Finding the previous line start is a
 //! backwards scan for `\n`, which costs one line's worth of bytes — so
 //! scrolling is O(line length) and the memory cost of navigation is zero. An
-//! index over an 8 MB Window would be hundreds of kilobytes to save work that
-//! is already too cheap to measure.
+//! index over a Window would be a sizeable fraction of the Window itself, to
+//! save work that is already too cheap to measure.
 
 const std = @import("std");
 const os = @import("os.zig");
@@ -187,17 +187,33 @@ pub const Archive = struct {
         return self.window.end;
     }
 
+    /// A line and where the next one starts. Returned together because every
+    /// caller wants both: a renderer walking down a pane and a printer walking
+    /// forward through new output each need the text *and* the offset to
+    /// resume at, and asking for them separately means scanning for the same
+    /// newline twice.
+    pub const Line = struct {
+        text: []const u8,
+        /// Absolute offset just past this line's newline.
+        end: u64,
+    };
+
     /// Copies the line starting at `off` into `dst`, without its newline.
     /// Truncated to `dst.len` — a Worker that emits a megabyte without a
     /// newline must not be able to make the renderer allocate.
-    pub fn lineInto(self: Archive, off: u64, dst: []u8) []const u8 {
+    pub fn lineAt(self: Archive, off: u64, dst: []u8) Line {
         const end = self.lineEnd(off);
         const want = @min(dst.len, @as(usize, @intCast(end - off)));
         const n = self.readAt(off, dst[0..want]);
         var line = dst[0..n];
         if (line.len > 0 and line[line.len - 1] == '\n') line = line[0 .. line.len - 1];
         if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-        return line;
+        return .{ .text = line, .end = end };
+    }
+
+    /// `lineAt` for callers that do not need to walk on from here.
+    pub fn lineInto(self: Archive, off: u64, dst: []u8) []const u8 {
+        return self.lineAt(off, dst).text;
     }
 
     /// Offset of the start of the last complete line, used to park the view at

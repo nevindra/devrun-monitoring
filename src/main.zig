@@ -33,8 +33,11 @@ const usage =
     \\  devrun start|stop|restart NAME  Act on one Worker of a running Session
     \\
     \\Options:
-    \\  -f FILE     Config to read (default: process-compose.yaml)
-    \\  --plain     Never draw the TUI, even on a terminal
+    \\  -f FILE            Config to read (default: process-compose.yaml)
+    \\  --plain            Never draw the TUI, even on a terminal
+    \\  --window-bytes N   In-memory log cache across all processes (default 1M).
+    \\                     Accepts K/M/G. Scrollback past it is read from the
+    \\                     log file, so this trades RSS for nothing much.
     \\
     \\Logs are files. `.devrun/logs/<name>.log` is a plain file being appended
     \\to right now — tail it, grep it, open it in an editor.
@@ -58,8 +61,15 @@ pub fn main(init: std.process.Init) !u8 {
 
     var cli: Cli = .{ .environ = init.environ_map, .io = io, .gpa = gpa };
     var positional: [8][]const u8 = undefined;
-    const rest = cli.parseFlags(args[2..], &positional) catch {
-        try err(io, "devrun: -f needs a file path\n", .{});
+    const rest = cli.parseFlags(args[2..], &positional) catch |e| {
+        switch (e) {
+            error.BadWindowBytes => try err(
+                io,
+                "devrun: --window-bytes needs a size, like 1M, 512K, or 262144\n",
+                .{},
+            ),
+            else => try err(io, "devrun: -f needs a file path\n", .{}),
+        }
         return 2;
     };
 
@@ -107,6 +117,9 @@ const Cli = struct {
     environ: *const std.process.Environ.Map,
     path: []const u8 = "process-compose.yaml",
     force_plain: bool = false,
+    /// Zero means "whatever the Supervisor's default is", so the default lives
+    /// in one place rather than being restated here.
+    window_bytes: usize = 0,
 
     /// Pulls the options out and hands back whatever was positional, written
     /// into `into` so the result outlives this frame. Every slice points at
@@ -126,6 +139,10 @@ const Cli = struct {
                 self.path = args[i];
             } else if (std.mem.eql(u8, a, "--plain")) {
                 self.force_plain = true;
+            } else if (std.mem.eql(u8, a, "--window-bytes")) {
+                i += 1;
+                if (i >= args.len) return error.BadWindowBytes;
+                self.window_bytes = parseSize(args[i]) orelse return error.BadWindowBytes;
             } else if (n < into.len) {
                 into[n] = a;
                 n += 1;
@@ -233,12 +250,15 @@ const Cli = struct {
         var sup_diag: supervisor.Diagnostic = .{};
         defer sup_diag.deinit(self.gpa);
 
-        var sup = supervisor.Supervisor.init(self.gpa, &cfg, .{
+        var opts: supervisor.Options = .{
             .io = self.io,
             .environ = self.environ,
             .base_dir = base,
             .log_dir = dirs.logs,
-        }, &sup_diag) catch |e| {
+        };
+        if (self.window_bytes > 0) opts.window_budget = self.window_bytes;
+
+        var sup = supervisor.Supervisor.init(self.gpa, &cfg, opts, &sup_diag) catch |e| {
             if (sup_diag.message) |m| {
                 try err(self.io, "devrun: {s}\n", .{m});
             } else {
@@ -309,6 +329,25 @@ const Cli = struct {
     }
 };
 
+/// A byte count with an optional binary suffix: `262144`, `512K`, `4M`. Null
+/// rather than a default on anything unparseable — a mistyped size silently
+/// becoming 1 MiB is how you spend an afternoon wondering why a flag did
+/// nothing.
+fn parseSize(text: []const u8) ?usize {
+    if (text.len == 0) return null;
+    const last = text[text.len - 1];
+    const shift: u6 = switch (last) {
+        'k', 'K' => 10,
+        'm', 'M' => 20,
+        'g', 'G' => 30,
+        else => 0,
+    };
+    const digits = if (shift == 0) text else text[0 .. text.len - 1];
+    if (digits.len == 0) return null;
+    const n = std.fmt.parseInt(usize, digits, 10) catch return null;
+    return std.math.shlExact(usize, n, shift) catch null;
+}
+
 const log_dir_suffix = ".devrun/logs";
 
 /// The per-Session paths, all under `.devrun/` beside the config.
@@ -356,6 +395,25 @@ fn anyFailed(sup: *supervisor.Supervisor) bool {
         if (w.state == .failed) return true;
     }
     return false;
+}
+
+test "parseSize reads binary suffixes and refuses anything else" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(?usize, 262144), parseSize("262144"));
+    try testing.expectEqual(@as(?usize, 512 << 10), parseSize("512K"));
+    try testing.expectEqual(@as(?usize, 512 << 10), parseSize("512k"));
+    try testing.expectEqual(@as(?usize, 4 << 20), parseSize("4M"));
+    try testing.expectEqual(@as(?usize, 2 << 30), parseSize("2G"));
+
+    // A typo is a refusal, not a default: silently reading "1MB" as 1 byte —
+    // or as anything at all — is worse than saying no.
+    try testing.expect(parseSize("1MB") == null);
+    try testing.expect(parseSize("") == null);
+    try testing.expect(parseSize("K") == null);
+    try testing.expect(parseSize("-1") == null);
+    try testing.expect(parseSize("lots") == null);
+    // And a size that cannot be represented is refused rather than wrapped.
+    try testing.expect(parseSize("99999999999G") == null);
 }
 
 test {

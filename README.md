@@ -22,7 +22,7 @@ and "copy this log" stops being a feature that has to be invented.
 ```
                   ┌─ .devrun/logs/<name>.log ──→ tail · grep · less · $EDITOR
 process ──stdout──┤
-                  └─ in-memory window (8 MB)  ──→ TUI, scrolls past it via pread
+                  └─ in-memory window (1 MB)  ──→ TUI, scrolls past it via pread
 
 .devrun/control.sock ──→ start · stop · restart · status · samples   (never logs)
 ```
@@ -102,6 +102,7 @@ prefixed lines instead, so `devrun up | tee build.log` and CI both work.
 ```console
 $ devrun up                  # TUI
 $ devrun up --plain          # prefixed lines, no terminal control
+$ devrun up --window-bytes 8M  # a larger in-memory cache; the log is unaffected
 $ devrun config              # what devrun understood from the file
 $ devrun logs api            # prints the Archive's path — the log is a file
 $ devrun status              # ask a running Session what it is doing
@@ -128,6 +129,11 @@ Copy uses OSC 52, so it reaches your real clipboard through SSH and tmux. And
 scrolling back past the in-memory Window reads the Archive with `pread`, which
 for anything written this Session is the page cache — so the scrollback is the
 whole run, not the last few megabytes.
+
+That fallback is why the Window is only a megabyte. It is a cache in front of
+the file, not the record, and a page-cache read runs at the speed of the memcpy
+it replaces — so a bigger Window buys nothing you can measure and costs RSS on
+exactly the Worker that is noisiest. `--window-bytes` is there if you disagree.
 
 ## Roadmap
 

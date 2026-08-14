@@ -94,6 +94,8 @@ const Ui = struct {
     /// generation counter, so a quiet Session costs one poll wake-up and no
     /// terminal traffic at all.
     drawn_generation: u64 = std.math.maxInt(u64),
+    /// When the last frame was built, for the rate cap in `render`.
+    last_frame_ms: u64 = 0,
     status: []const u8 = "",
     exit_code: u8 = 0,
     /// Width of the sidebar's name column, fixed for the Session so the
@@ -356,11 +358,27 @@ const Ui = struct {
 
     // ------------------------------------------------------------- render
 
+    /// Floor on how often a frame may be built. `generation` moves with a
+    /// Worker's output rather than with a clock, and that same output is what
+    /// wakes the loop — so a Worker printing a line at a time was getting one
+    /// full redraw per line. At 60 Hz every frame a reader can perceive still
+    /// happens and the ones in between stop being built.
+    const min_frame_ms = 16;
+
     fn render(self: *Ui) !void {
-        const size = self.tty.size();
-        const resized = size.rows != self.size.rows or size.cols != self.size.cols;
-        self.size = size;
-        if (!resized and self.drawn_generation == self.sup.generation) return;
+        if (self.drawn_generation == self.sup.generation) return;
+
+        // Skipped frames are delayed, never dropped: `drawn_generation` is
+        // left behind deliberately, and the loop's next poll returns within
+        // `max_wait_ms` at the latest and calls this again.
+        const now = os.nowMs();
+        if (now -| self.last_frame_ms < min_frame_ms) return;
+        self.last_frame_ms = now;
+
+        // Only worth an ioctl when a frame is actually going to be built. A
+        // resize arrives as SIGWINCH, which bumps `generation`, so asking on
+        // every pass through an idle loop learned nothing.
+        self.size = self.tty.size();
         self.drawn_generation = self.sup.generation;
 
         self.frame.clearRetainingCapacity();
@@ -378,7 +396,7 @@ const Ui = struct {
         const sel = &self.sup.workers[self.selected];
         try w.writeAll(esc.reverse);
         var used: usize = 0;
-        used += try printClamped(w, self.size.cols, " devrun ", &.{});
+        used += try printClamped(w, self.size.cols, " devrun ");
 
         var buf: [256]u8 = undefined;
         const s = self.sup.samples[self.selected];
@@ -391,7 +409,7 @@ const Ui = struct {
             s.write_bytes,
             s.processes,
         });
-        used += try printClamped(w, @as(usize, self.size.cols) -| used, line, &.{});
+        used += try printClamped(w, @as(usize, self.size.cols) -| used, line);
         try w.splatByteAll(' ', @as(usize, self.size.cols) -| used);
         try w.writeAll(esc.reset ++ "\n");
     }
@@ -416,15 +434,15 @@ const Ui = struct {
                 const highlighted = self.mode == .visual and at >= sel_lo and at <= sel_hi;
                 if (highlighted) try w.writeAll(esc.reverse);
 
-                const line = a.lineInto(at, &line_buf);
-                const fit = term.fitToWidth(line, log_w);
-                try w.writeAll(line[0..fit.bytes]);
+                const line = a.lineAt(at, &line_buf);
+                const fit = term.fitToWidth(line.text, log_w);
+                try w.writeAll(line.text[0..fit.bytes]);
                 // A truncated line can end mid-colour; a highlighted one has
                 // reverse video to clear. Either way the row must not bleed
                 // into the next.
                 if (fit.truncated or highlighted or fit.cols > 0) try w.writeAll(esc.reset);
 
-                at = a.lineEnd(at);
+                at = line.end;
             }
             try w.writeAll(esc.clear_line ++ "\n");
         }
@@ -470,7 +488,7 @@ const Ui = struct {
 
         if (chosen) try w.writeAll(esc.bold);
         try w.writeAll(stateColour(x.state));
-        const used = try printClamped(w, sidebar_cols, text, &.{});
+        const used = try printClamped(w, sidebar_cols, text);
         try w.writeAll(esc.reset);
         try w.splatByteAll(' ', sidebar_cols -| used);
     }
@@ -483,7 +501,7 @@ const Ui = struct {
             "↑/↓ extend  y copy  Esc cancel"
         else
             "n/p worker  j/k scroll  g/G top/bottom  v select  y copy  s/r/S stop/restart/start  q quit";
-        const used = try printClamped(w, self.size.cols, help, &.{});
+        const used = try printClamped(w, self.size.cols, help);
         try w.splatByteAll(' ', @as(usize, self.size.cols) -| used);
         try w.writeAll(esc.reset ++ esc.clear_line);
     }
@@ -505,7 +523,7 @@ fn stateColour(s: supervisor.State) []const u8 {
 /// Writes `text` truncated to `limit` visible columns, returning how many it
 /// used. The escape-aware measurement is what keeps a coloured name from
 /// eating the column budget it does not occupy.
-fn printClamped(w: *std.Io.Writer, limit: usize, text: []const u8, _: []const u8) !usize {
+fn printClamped(w: *std.Io.Writer, limit: usize, text: []const u8) !usize {
     const fit = term.fitToWidth(text, limit);
     try w.writeAll(text[0..fit.bytes]);
     if (fit.truncated) try w.writeAll(esc.reset);
@@ -526,7 +544,7 @@ test "printClamped truncates on visible columns and resets afterwards" {
     var buf: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
 
-    const used = try printClamped(&w, 5, "\x1b[31mabcdefgh\x1b[0m", &.{});
+    const used = try printClamped(&w, 5, "\x1b[31mabcdefgh\x1b[0m");
     try testing.expectEqual(@as(usize, 5), used);
     // The colour is kept, the overflow is dropped, and the style is closed so
     // the next thing written to the row is not red.

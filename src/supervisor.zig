@@ -165,7 +165,15 @@ pub const Options = struct {
     /// Where Archives are written.
     log_dir: []const u8,
     /// Total in-memory Window budget across all Workers.
-    window_budget: usize = 8 << 20,
+    ///
+    /// Deliberately small. The Window is a cache in front of the Archive, not
+    /// the record, and `Archive.readAt` falls through to `pread` for anything
+    /// older — which for bytes written this Session is a page-cache copy, at
+    /// the speed the memcpy it replaced would have run at. Spending eight
+    /// megabytes to avoid that read bought nothing measurable and cost 7.7 MB
+    /// of RSS on a noisy Worker. `--window-bytes` raises it for anyone who
+    /// wants the old size back.
+    window_budget: usize = 1 << 20,
 };
 
 pub const Diagnostic = struct {
@@ -187,6 +195,11 @@ pub const Supervisor = struct {
     /// once, because shutdown walks it on every pass and rediscovering it by
     /// scanning every `depends_on` would be quadratic per pass.
     dependents: [][]const u32,
+    /// Forward edges, resolved: `dep_targets[i][k]` is the Worker index that
+    /// `workers[i].spec.depends_on[k]` names. The state machine asks this on
+    /// every pass, and looking it up by string there meant a `memcmp` against
+    /// every Worker's name several times a second forever.
+    dep_targets: [][]const u32,
 
     signals: os.Signals,
     devnull: os.Fd,
@@ -297,6 +310,7 @@ pub const Supervisor = struct {
         }
 
         const dependents = try buildDependents(arena, cfg.workers);
+        const dep_targets = try buildDepTargets(arena, cfg);
 
         var signals = try os.Signals.install(&.{ .CHLD, .INT, .TERM, .HUP, .WINCH });
         errdefer signals.deinit();
@@ -311,6 +325,7 @@ pub const Supervisor = struct {
             .cfg = cfg,
             .workers = workers,
             .dependents = dependents,
+            .dep_targets = dep_targets,
             .signals = signals,
             .devnull = devnull,
             .shell = .{ .path = shell_path.ptr, .argument = cfg.shell.argument },
@@ -614,9 +629,9 @@ pub const Supervisor = struct {
     /// screen to explain the silence.
     fn dependencyStatus(self: *Supervisor, i: usize) DepStatus {
         var worst: DepStatus = .satisfied;
-        for (self.workers[i].spec.depends_on) |dep| {
-            const j = self.cfg.find(dep.name) orelse continue; // validated at load
-            const d = &self.workers[j];
+        for (self.workers[i].spec.depends_on, self.dep_targets[i]) |dep, target| {
+            if (target == unresolved_dep) continue; // validated at load
+            const d = &self.workers[target];
             const one: DepStatus = switch (dep.condition) {
                 .process_started => if (d.has_started)
                     .satisfied
@@ -881,6 +896,26 @@ fn resolveCwd(arena: Allocator, base_dir: []const u8, working_dir: ?[]const u8) 
     if (std.fs.path.isAbsolute(dir)) return (try arena.dupeZ(u8, dir)).ptr;
     const joined = try std.fs.path.join(arena, &.{ base_dir, dir });
     return (try arena.dupeZ(u8, joined)).ptr;
+}
+
+/// Stands in for a `depends_on` naming a Worker that is not in the config.
+/// `checkDependencies` rejects those at load, so this is unreachable in
+/// practice — but the state machine must not index `workers` with it if it
+/// ever is.
+const unresolved_dep = std.math.maxInt(u32);
+
+/// Resolves every `depends_on` name to a Worker index once, so the state
+/// machine never compares strings.
+fn buildDepTargets(arena: Allocator, cfg: *const config.Config) ![][]const u32 {
+    const out = try arena.alloc([]const u32, cfg.workers.len);
+    for (cfg.workers, out) |w, *slot| {
+        const targets = try arena.alloc(u32, w.depends_on.len);
+        for (w.depends_on, targets) |dep, *t| {
+            t.* = if (cfg.find(dep.name)) |j| @intCast(j) else unresolved_dep;
+        }
+        slot.* = targets;
+    }
+    return out;
 }
 
 /// Inverts the dependency edges once, so shutdown can ask "who is waiting on

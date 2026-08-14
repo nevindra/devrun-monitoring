@@ -75,16 +75,18 @@ pub const Printer = struct {
             const end = w.archive.len();
             var line_buf: [4096]u8 = undefined;
             while (at < end) {
-                const stop = w.archive.lineEnd(at);
+                // One scan per line: `lineAt` hands back the text and the
+                // offset to resume at, where asking for them separately meant
+                // finding the same newline twice for every line printed.
+                const line = w.archive.lineAt(at, &line_buf);
                 // An unterminated tail waits for the rest of its line.
-                if (stop == at) break;
-                if (stop == end and !endsWithNewline(&w.archive, end)) break;
+                if (line.end == at) break;
+                if (line.end == end and !endsWithNewline(&w.archive, end)) break;
 
-                const line = w.archive.lineInto(at, &line_buf);
                 try self.prefix(i, w.name(), out);
-                try out.writeAll(line);
+                try out.writeAll(line.text);
                 try out.writeAll("\n");
-                at = stop;
+                at = line.end;
             }
             self.printed[i] = at;
         }

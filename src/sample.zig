@@ -20,9 +20,20 @@
 //! reading is retired into the Group's running total when it disappears, and
 //! the Group's cumulative counter only ever increases.
 //!
-//! One scan serves every Worker. `/proc` is read once per tick, not once per
-//! Worker — that is the difference between one pass and N passes over a few
-//! hundred directories.
+//! ## Why the walk is our own subtree
+//!
+//! One scan serves every Worker, and it visits our descendants rather than
+//! every process on the machine. Reading all of `/proc` to find the dozen pids
+//! that are ours meant an open, a read and a close of `/proc/<pid>/stat` for
+//! several hundred unrelated processes every second — 97% of every syscall
+//! devrun made while idle, and a cost that grew with how busy the *machine*
+//! was rather than with how much devrun was supervising.
+//!
+//! Our own subtree is complete by construction: each Worker is a Group we
+//! forked, and `becomeSubreaper` keeps a daemonising Worker's orphans on our
+//! branch instead of letting them reparent to PID 1. A kernel without
+//! `CONFIG_PROC_CHILDREN` cannot be walked that way, so the full scan stays as
+//! the fallback.
 
 const std = @import("std");
 const os = @import("os.zig");
@@ -69,6 +80,10 @@ const PidState = struct {
     counters: Totals,
 };
 
+/// Stops a pathological tree — or a `children` file that somehow cycles — from
+/// turning one tick into an unbounded walk.
+const max_visited = 4096;
+
 pub const Sampler = struct {
     gpa: Allocator,
     /// Cumulative per Group, including retired pids.
@@ -79,18 +94,35 @@ pub const Sampler = struct {
     tick: u64 = 0,
     last_ms: u64 = 0,
 
+    /// Work list for the descendant walk, and the pids to retire after one.
+    /// Both are kept across ticks so a steady-state tick allocates nothing.
+    frontier: std.ArrayListUnmanaged(Pid) = .empty,
+    doomed: std.ArrayListUnmanaged(Pid) = .empty,
+    /// Whether this kernel exposes `/proc/<pid>/task/<tid>/children`. When it
+    /// does, a tick visits our own descendants — a handful of processes —
+    /// instead of every process on the machine.
+    walk_children: bool,
+
     pub fn init(gpa: Allocator, groups: usize) !Sampler {
         const totals = try gpa.alloc(Totals, groups);
         @memset(totals, .{});
+        errdefer gpa.free(totals);
         const previous = try gpa.alloc(Totals, groups);
         @memset(previous, .{});
-        return .{ .gpa = gpa, .totals = totals, .previous = previous };
+        return .{
+            .gpa = gpa,
+            .totals = totals,
+            .previous = previous,
+            .walk_children = childrenSupported(),
+        };
     }
 
     pub fn deinit(self: *Sampler) void {
         self.gpa.free(self.totals);
         self.gpa.free(self.previous);
         self.live.deinit(self.gpa);
+        self.frontier.deinit(self.gpa);
+        self.doomed.deinit(self.gpa);
     }
 
     /// Reads every Group in one pass over `/proc` and writes the results into
@@ -125,7 +157,11 @@ pub const Sampler = struct {
         defer if (count_heap) |h| self.gpa.free(h);
         @memset(live_count, 0);
 
-        self.scanProc(pgids, live_mem, live_count);
+        if (self.walk_children) {
+            self.scanDescendants(pgids, live_mem, live_count);
+        } else {
+            self.scanProc(pgids, live_mem, live_count);
+        }
         self.retireDeadPids();
 
         // Elapsed time drives the rate. Using the actual interval rather than
@@ -151,64 +187,146 @@ pub const Sampler = struct {
         }
     }
 
-    /// One pass over `/proc`, attributing each process to a Group by its pgid.
+    /// Our own process tree, walked breadth-first from this pid.
+    ///
+    /// This is the whole reason a tick is cheap. Everything a Group contains
+    /// is a descendant of devrun — we spawn each Worker ourselves, and
+    /// `becomeSubreaper` means even a daemonising Worker's orphans come back
+    /// to us rather than escaping to PID 1 — so reading our own subtree finds
+    /// exactly the same processes that reading all of `/proc` would, having
+    /// looked at a dozen of them instead of several hundred.
+    ///
+    /// A `children` file can miss a pid that forks while it is being read.
+    /// That is self-correcting and already handled: an unseen pid is retired
+    /// with its last reading intact, which is what happens when one genuinely
+    /// exits, and the next tick picks it up again if it is still alive.
+    fn scanDescendants(self: *Sampler, pgids: []const Pid, live_mem: []u64, live_count: []u32) void {
+        self.frontier.clearRetainingCapacity();
+        self.frontier.append(self.gpa, os.linux.getpid()) catch return;
+
+        var i: usize = 0;
+        while (i < self.frontier.items.len and i < max_visited) : (i += 1) {
+            const pid = self.frontier.items[i];
+            self.pushChildren(pid);
+            // devrun itself is slot zero. It is accounted like any other pid
+            // rather than special-cased out: its pgid cannot match a Worker's
+            // — a Worker's Group id is the pid of a process we forked, which
+            // is never our own — so this walk and the `/proc` fallback reach
+            // the same answer, and neither has a case the other lacks.
+            self.account(pid, pgids, live_mem, live_count);
+        }
+    }
+
+    /// Appends `pid`'s children to the frontier. Every thread is asked, not
+    /// just the main one: a `children` file lists what *that thread* forked,
+    /// so a runtime that spawns from a worker thread would otherwise have its
+    /// children go unseen.
+    fn pushChildren(self: *Sampler, pid: Pid) void {
+        var path: [64]u8 = undefined;
+        const tasks_path = std.fmt.bufPrintZ(&path, "/proc/{d}/task", .{pid}) catch return;
+        var tasks = os.DirIter.open(tasks_path) catch return;
+        defer tasks.close();
+
+        while (tasks.next()) |entry| {
+            const tid = std.fmt.parseInt(Pid, entry, 10) catch continue;
+            var child_path: [80]u8 = undefined;
+            const p = std.fmt.bufPrintZ(
+                &child_path,
+                "/proc/{d}/task/{d}/children",
+                .{ pid, tid },
+            ) catch continue;
+
+            var buf: [4096]u8 = undefined;
+            const text = readSmallFile(p, &buf) orelse continue;
+            var it = std.mem.tokenizeAny(u8, text, " \t\n");
+            while (it.next()) |tok| {
+                const child = std.fmt.parseInt(Pid, tok, 10) catch continue;
+                if (self.frontier.items.len >= max_visited) return;
+                self.frontier.append(self.gpa, child) catch return;
+            }
+        }
+    }
+
+    /// One pass over all of `/proc`. The fallback for a kernel built without
+    /// `CONFIG_PROC_CHILDREN`, where the subtree is not discoverable and
+    /// matching every process by pgid is the only way to find a Group.
     fn scanProc(self: *Sampler, pgids: []const Pid, live_mem: []u64, live_count: []u32) void {
         var dir = os.DirIter.open("/proc") catch return;
         defer dir.close();
 
         while (dir.next()) |entry| {
             const pid = std.fmt.parseInt(Pid, entry, 10) catch continue;
-
-            const stat: ProcStat = readStat(pid) orelse continue;
-            const group = indexOfPgid(pgids, stat.pgid) orelse continue;
-
-            live_mem[group] += stat.rss_pages * std.heap.pageSize();
-            live_count[group] += 1;
-
-            const io = readIo(pid);
-            const counters = Totals{
-                .cpu_ticks = stat.utime + stat.stime,
-                .read_bytes = io.read,
-                .write_bytes = io.write,
-            };
-
-            const gop = self.live.getOrPut(self.gpa, pid) catch return;
-            if (!gop.found_existing) {
-                gop.value_ptr.* = .{
-                    .group = @intCast(group),
-                    .seen_tick = self.tick,
-                    .counters = .{},
-                };
-            }
-            const st = gop.value_ptr;
-
-            // A pid is only ever compared against itself, so the delta cannot
-            // be polluted by a different process reusing the number: a reused
-            // pid arrives as `!found_existing` with a zeroed baseline.
-            self.totals[group].cpu_ticks += counters.cpu_ticks -| st.counters.cpu_ticks;
-            self.totals[group].read_bytes += counters.read_bytes -| st.counters.read_bytes;
-            self.totals[group].write_bytes += counters.write_bytes -| st.counters.write_bytes;
-
-            st.counters = counters;
-            st.seen_tick = self.tick;
-            st.group = @intCast(group);
+            self.account(pid, pgids, live_mem, live_count);
         }
+    }
+
+    /// Folds one process into its Group's numbers, if it is in one.
+    fn account(self: *Sampler, pid: Pid, pgids: []const Pid, live_mem: []u64, live_count: []u32) void {
+        const stat: ProcStat = readStat(pid) orelse return;
+        const group = indexOfPgid(pgids, stat.pgid) orelse return;
+
+        live_mem[group] += stat.rss_pages * std.heap.pageSize();
+        live_count[group] += 1;
+
+        const io = readIo(pid);
+        const counters = Totals{
+            .cpu_ticks = stat.utime + stat.stime,
+            .read_bytes = io.read,
+            .write_bytes = io.write,
+        };
+
+        const gop = self.live.getOrPut(self.gpa, pid) catch return;
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{
+                .group = @intCast(group),
+                .seen_tick = self.tick,
+                .counters = .{},
+            };
+        }
+        const st = gop.value_ptr;
+
+        // A pid is only ever compared against itself, so the delta cannot be
+        // polluted by a different process reusing the number: a reused pid
+        // arrives as `!found_existing` with a zeroed baseline.
+        self.totals[group].cpu_ticks += counters.cpu_ticks -| st.counters.cpu_ticks;
+        self.totals[group].read_bytes += counters.read_bytes -| st.counters.read_bytes;
+        self.totals[group].write_bytes += counters.write_bytes -| st.counters.write_bytes;
+
+        st.counters = counters;
+        st.seen_tick = self.tick;
+        st.group = @intCast(group);
     }
 
     /// Drops pids that were not seen this tick. Their contribution already
     /// lives in `totals`, which is the entire point of accumulating there
     /// rather than re-summing the live set each time.
+    ///
+    /// Collected first, removed second: mutating a hash map through a live
+    /// iterator is not allowed, and restarting the iterator after each removal
+    /// — which is what this used to do — costs O(retired × live) on exactly
+    /// the Worker that retires most, one that forks per request.
     fn retireDeadPids(self: *Sampler) void {
+        self.doomed.clearRetainingCapacity();
         var it = self.live.iterator();
         while (it.next()) |e| {
             if (e.value_ptr.seen_tick == self.tick) continue;
-            // `removeByPtr` keeps the iterator valid in Zig's hash map.
-            const key = e.key_ptr.*;
-            _ = self.live.remove(key);
-            it = self.live.iterator();
+            self.doomed.append(self.gpa, e.key_ptr.*) catch break;
         }
+        for (self.doomed.items) |key| _ = self.live.remove(key);
     }
 };
+
+/// Whether this kernel exposes the per-thread `children` list. Checked once,
+/// because a kernel does not grow the file halfway through a Session.
+fn childrenSupported() bool {
+    const pid = os.linux.getpid();
+    var path: [80]u8 = undefined;
+    const p = std.fmt.bufPrintZ(&path, "/proc/{d}/task/{d}/children", .{ pid, pid }) catch
+        return false;
+    const fd = os.open(p, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0) catch return false;
+    os.close(fd);
+    return true;
+}
 
 fn cpuPercent(ticks: u64, elapsed_ms: u64) f32 {
     const cpu_ms = ticks * (1000 / user_hz);
