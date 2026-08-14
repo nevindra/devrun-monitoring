@@ -128,6 +128,20 @@ pub fn unlink(path: [*:0]const u8) void {
     _ = linux.unlink(path);
 }
 
+/// The working directory, or null when it will not fit or cannot be read.
+///
+/// Null rather than an error: the one caller wants a name to put on screen,
+/// and a Session with no name on it is a smaller problem than a Session that
+/// refused to start over one.
+pub fn getcwd(buf: []u8) ?[]const u8 {
+    const rc = linux.getcwd(buf.ptr, buf.len);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    // The kernel counts the NUL it wrote; a caller wants the name without it.
+    const n = @as(usize, rc);
+    if (n < 2) return null;
+    return buf[0 .. n - 1];
+}
+
 /// `mkdir -p`. Creates each component in turn and treats "already there" as
 /// success, which is the only outcome a caller distinguishes.
 pub fn makePath(path: []const u8) !void {

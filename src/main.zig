@@ -250,11 +250,22 @@ const Cli = struct {
         var sup_diag: supervisor.Diagnostic = .{};
         defer sup_diag.deinit(self.gpa);
 
+        // The directory the config was read from, which is the name a reader
+        // already has for this repo. "." means the one they are standing in,
+        // so that resolves to the working directory's own name rather than
+        // showing a Session called ".".
+        var cwd_buf: [4096]u8 = undefined;
+        const named = std.fs.path.basename(base);
+        const project = if (named.len > 0 and !std.mem.eql(u8, named, "."))
+            named
+        else if (os.getcwd(&cwd_buf)) |cwd| std.fs.path.basename(cwd) else "";
+
         var opts: supervisor.Options = .{
             .io = self.io,
             .environ = self.environ,
             .base_dir = base,
             .log_dir = dirs.logs,
+            .project = project,
         };
         if (self.window_bytes > 0) opts.window_budget = self.window_bytes;
 

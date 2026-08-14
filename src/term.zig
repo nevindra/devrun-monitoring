@@ -44,7 +44,22 @@ pub const esc = struct {
     pub const bold = "\x1b[1m";
     pub const dim = "\x1b[2m";
     pub const reverse = "\x1b[7m";
+    pub const underline = "\x1b[4m";
     pub const home = "\x1b[H";
+
+    /// Turns bold and dim off while leaving underline standing. A row drawn as
+    /// a rule needs its weight to change mid-line without the rule breaking,
+    /// and `reset` would take the underline with it.
+    pub const weight_off = "\x1b[22m";
+    /// Back to the terminal's own foreground, again without disturbing the
+    /// rest of the attributes.
+    pub const fg_off = "\x1b[39m";
+
+    /// Button presses, motion while a button is held, and SGR coordinates —
+    /// the last of which is what lifts the old 223-column ceiling on where a
+    /// click can be reported.
+    pub const mouse_on = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+    pub const mouse_off = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 };
 
 pub const Terminal = struct {
@@ -99,6 +114,17 @@ pub const Terminal = struct {
 
 // ------------------------------------------------------------- input
 
+/// Where the pointer was and what it did. Reported in the terminal's own
+/// 1-based cell coordinates, so a caller hit-tests against the same grid it
+/// drew into.
+pub const Mouse = struct {
+    pub const Kind = enum { press, drag, release, wheel_up, wheel_down };
+
+    kind: Kind,
+    col: u16,
+    row: u16,
+};
+
 pub const Key = union(enum) {
     char: u21,
     up,
@@ -112,6 +138,7 @@ pub const Key = union(enum) {
     escape,
     enter,
     backspace,
+    mouse: Mouse,
     /// Something arrived that this does not decode. Ignored by the caller,
     /// but distinct from "nothing arrived".
     unknown,
@@ -156,6 +183,7 @@ pub fn decodeKey(buf: []const u8) ?struct { key: Key, len: usize } {
                     else => .unknown,
                 };
             },
+            'M', 'm' => decodeMouse(params, final),
             else => .unknown,
         };
         return .{ .key = key, .len = len };
@@ -171,6 +199,37 @@ pub fn decodeKey(buf: []const u8) ?struct { key: Key, len: usize } {
     const cp = std.unicode.utf8Decode(buf[0..seq_len]) catch
         return .{ .key = .{ .char = b }, .len = 1 };
     return .{ .key = .{ .char = cp }, .len = seq_len };
+}
+
+/// Decodes the parameters of an SGR mouse report — `<button;col;row` followed
+/// by `M` for a press and `m` for a release.
+///
+/// Only the left button is reported onward. A right-click is how a terminal
+/// emulator raises its own context menu, and a caller that acted on it would
+/// be taking that away from the reader.
+fn decodeMouse(params: []const u8, final: u8) Key {
+    if (params.len < 2 or params[0] != '<') return .unknown;
+
+    var it = std.mem.splitScalar(u8, params[1..], ';');
+    const button = std.fmt.parseInt(u16, it.next() orelse return .unknown, 10) catch return .unknown;
+    const col = std.fmt.parseInt(u16, it.next() orelse return .unknown, 10) catch return .unknown;
+    const row = std.fmt.parseInt(u16, it.next() orelse return .unknown, 10) catch return .unknown;
+    if (it.next() != null) return .unknown;
+
+    // Bit 6 marks the wheel, and its low bit picks the direction; bit 5 marks
+    // motion with a button still down.
+    const kind: Mouse.Kind = if (button & 0x40 != 0)
+        (if (button & 1 != 0) .wheel_down else .wheel_up)
+    else if (button & 0x03 != 0)
+        return .unknown
+    else if (button & 0x20 != 0)
+        .drag
+    else if (final == 'm')
+        .release
+    else
+        .press;
+
+    return .{ .mouse = .{ .kind = kind, .col = col, .row = row } };
 }
 
 // ------------------------------------------------------------- output
@@ -236,6 +295,14 @@ fn escapeLen(bytes: []const u8) usize {
             }
             return bytes.len;
         },
+        // Intermediate bytes run on until a final one, so `ESC ( B` is three
+        // bytes. Measuring it as two leaves its `B` occupying a column that
+        // nothing is drawn in.
+        0x20...0x2f => {
+            var i: usize = 2;
+            while (i < bytes.len and bytes[i] >= 0x20 and bytes[i] <= 0x2f) i += 1;
+            return @min(i + 1, bytes.len);
+        },
         else => return 2,
     }
 }
@@ -261,6 +328,76 @@ fn charWidth(cp: u21) usize {
         (cp >= 0x20000 and cp <= 0x3fffd)) return 2;
     return 1;
 }
+
+/// Drops ANSI escapes from a stream on its way out of the view.
+///
+/// The Archive stays byte-faithful — that is the whole point of it, and
+/// `less` and `grep` still see every escape a Worker wrote. But an Excerpt is
+/// going to a *clipboard*, which has no colours to put them in. On screen
+/// `\x1b[31m` is what makes the word ERROR red; pasted into a chat window it
+/// is four characters of noise in front of it, and the reader never saw them
+/// to know to delete them.
+///
+/// So the shape of an Excerpt follows the view it was taken from, per
+/// CONTEXT.md: what the view *showed* was the text, and it spent the escapes
+/// on colour rather than printing them.
+///
+/// The state persists across calls, so a sequence split down the middle by a
+/// chunk boundary is still recognised — and because it is a state machine
+/// rather than a buffer, an OSC string of any length costs nothing to skip.
+pub const AnsiFilter = struct {
+    state: enum { text, escape, escape_inter, csi, string, string_esc } = .text,
+
+    pub fn feed(self: *AnsiFilter, w: *std.Io.Writer, bytes: []const u8) !void {
+        var plain_from: usize = 0;
+        for (bytes, 0..) |b, i| {
+            switch (self.state) {
+                // Runs of ordinary bytes are written in one go rather than one
+                // at a time; a log line with no escapes in it costs a single
+                // `writeAll` for the whole line.
+                .text => if (b == 0x1b) {
+                    try w.writeAll(bytes[plain_from..i]);
+                    self.state = .escape;
+                },
+                .escape => {
+                    plain_from = i + 1;
+                    self.state = switch (b) {
+                        '[' => .csi,
+                        ']', 'P', 'X', '^', '_' => .string,
+                        // Intermediates carry on to a final byte: `ESC ( B`
+                        // is three bytes, not two, and stopping early would
+                        // leave its `B` in the text.
+                        0x20...0x2f => .escape_inter,
+                        // A two-byte escape ends here.
+                        else => .text,
+                    };
+                },
+                .escape_inter => {
+                    plain_from = i + 1;
+                    if (b >= 0x30 and b <= 0x7e) self.state = .text;
+                },
+                .csi => {
+                    plain_from = i + 1;
+                    if (b >= 0x40 and b <= 0x7e) self.state = .text;
+                },
+                .string => {
+                    plain_from = i + 1;
+                    // Terminated by BEL, or by ST — which starts with ESC.
+                    switch (b) {
+                        0x07 => self.state = .text,
+                        0x1b => self.state = .string_esc,
+                        else => {},
+                    }
+                },
+                .string_esc => {
+                    plain_from = i + 1;
+                    self.state = if (b == '\\') .text else .string;
+                },
+            }
+        }
+        if (self.state == .text) try w.writeAll(bytes[plain_from..]);
+    }
+};
 
 /// The largest Excerpt worth attempting. Terminals cap how much OSC 52 they
 /// will accept and silently drop anything longer, so devrun does the
@@ -341,6 +478,43 @@ test "a half-arrived escape sequence decodes to nothing, not to a wrong key" {
     try testing.expectEqual(Key.escape, decodeKey("\x1b").?.key);
 }
 
+test "decodeKey reads SGR mouse reports as one key each" {
+    const press = decodeKey("\x1b[<0;41;7M").?;
+    try testing.expectEqual(Mouse.Kind.press, press.key.mouse.kind);
+    try testing.expectEqual(@as(u16, 41), press.key.mouse.col);
+    try testing.expectEqual(@as(u16, 7), press.key.mouse.row);
+    try testing.expectEqual(@as(usize, 10), press.len);
+
+    // The same coordinates with a lowercase final byte are the button coming
+    // back up, which is what ends a drag.
+    try testing.expectEqual(Mouse.Kind.release, decodeKey("\x1b[<0;41;7m").?.key.mouse.kind);
+    // Bit 5 set: motion with the button still down.
+    try testing.expectEqual(Mouse.Kind.drag, decodeKey("\x1b[<32;41;9M").?.key.mouse.kind);
+    try testing.expectEqual(Mouse.Kind.wheel_up, decodeKey("\x1b[<64;5;5M").?.key.mouse.kind);
+    try testing.expectEqual(Mouse.Kind.wheel_down, decodeKey("\x1b[<65;5;5M").?.key.mouse.kind);
+
+    // Coordinates past 223 columns are the reason for SGR encoding at all.
+    try testing.expectEqual(@as(u16, 402), decodeKey("\x1b[<0;402;18M").?.key.mouse.col);
+}
+
+test "decodeKey ignores mouse buttons the TUI does not act on" {
+    // A right-click belongs to the terminal emulator's own context menu.
+    try testing.expectEqual(Key.unknown, decodeKey("\x1b[<2;10;10M").?.key);
+    // Middle-click is paste in most terminals.
+    try testing.expectEqual(Key.unknown, decodeKey("\x1b[<1;10;10M").?.key);
+    // Malformed reports decode to nothing rather than to a click at 0,0.
+    try testing.expectEqual(Key.unknown, decodeKey("\x1b[<0;10M").?.key);
+    try testing.expectEqual(Key.unknown, decodeKey("\x1b[<0;a;10M").?.key);
+    try testing.expectEqual(Key.unknown, decodeKey("\x1b[0;10;10M").?.key);
+}
+
+test "a half-arrived mouse report waits for the rest" {
+    // These land mid-sequence when a drag fills the read buffer. Guessing here
+    // would scatter clicks across the pane.
+    try testing.expect(decodeKey("\x1b[<0;41") == null);
+    try testing.expect(decodeKey("\x1b[<") == null);
+}
+
 test "decodeKey treats a multi-byte character as one key" {
     const k = decodeKey("é").?;
     try testing.expectEqual(@as(u21, 0xe9), k.key.char);
@@ -382,6 +556,85 @@ test "escapeLen spans OSC strings so their payload is not counted" {
     const fit = fitToWidth(link, 80);
     try testing.expectEqual(@as(usize, 4), fit.cols);
     try testing.expectEqual(link.len, fit.bytes);
+}
+
+test "escapeLen runs an escape past its intermediate bytes" {
+    // `ESC ( B` selects the ASCII charset and is three bytes. Measured as
+    // two, its final `B` would be counted as a column of text and drawn.
+    const charset = "\x1b(Bplain";
+    const fit = fitToWidth(charset, 80);
+    try testing.expectEqual(@as(usize, 5), fit.cols);
+    try testing.expectEqual(charset.len, fit.bytes);
+
+    // What the view measures and what a copy strips have to agree, or a line
+    // is one width on screen and another in the clipboard.
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var f: AnsiFilter = .{};
+    try f.feed(&w, charset);
+    try testing.expectEqual(fit.cols, w.buffered().len);
+}
+
+test "AnsiFilter keeps the text and drops what only the screen could use" {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var f: AnsiFilter = .{};
+
+    try f.feed(&w, "\x1b[31mERROR\x1b[0m: it broke\n");
+    try testing.expectEqualStrings("ERROR: it broke\n", w.buffered());
+
+    // An OSC 8 hyperlink leaves its label behind and takes its URL with it.
+    w = .fixed(&buf);
+    f = .{};
+    try f.feed(&w, "see \x1b]8;;https://example.com\x07the docs\x1b]8;;\x07 for more");
+    try testing.expectEqualStrings("see the docs for more", w.buffered());
+
+    // A string sequence terminated by ST rather than BEL.
+    w = .fixed(&buf);
+    f = .{};
+    try f.feed(&w, "a\x1b]0;window title\x1b\\b");
+    try testing.expectEqualStrings("ab", w.buffered());
+
+    // `ESC ( B` selects a charset and is three bytes; `ESC 7` saves the
+    // cursor and is two. Both go, and neither leaves its final byte behind.
+    w = .fixed(&buf);
+    f = .{};
+    try f.feed(&w, "x\x1b(By\x1b7z");
+    try testing.expectEqualStrings("xyz", w.buffered());
+}
+
+test "AnsiFilter survives a sequence split across chunks" {
+    // The Excerpt is read in 8 KiB chunks, so a colour code straddling a
+    // boundary is routine. Feeding a sequence one byte at a time is the worst
+    // case of that, and must give the same answer as feeding it whole.
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var f: AnsiFilter = .{};
+
+    const src = "keep\x1b[38;5;214mgoing\x1b]8;;https://x\x07done";
+    for (src) |b| try f.feed(&w, &[_]u8{b});
+    try testing.expectEqualStrings("keepgoingdone", w.buffered());
+
+    // And split at every possible single boundary, not just the byte-wise one.
+    var split: usize = 1;
+    while (split < src.len) : (split += 1) {
+        var b2: [256]u8 = undefined;
+        var w2: std.Io.Writer = .fixed(&b2);
+        var f2: AnsiFilter = .{};
+        try f2.feed(&w2, src[0..split]);
+        try f2.feed(&w2, src[split..]);
+        try testing.expectEqualStrings("keepgoingdone", w2.buffered());
+    }
+}
+
+test "AnsiFilter leaves a log with no escapes in it exactly as it was" {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var f: AnsiFilter = .{};
+
+    const plain = "08:26:59 INFO  GET /api/v1/orders 200 12ms\nnext line\n";
+    try f.feed(&w, plain);
+    try testing.expectEqualStrings(plain, w.buffered());
 }
 
 test "OSC 52 round-trips through base64 without padding in the middle" {

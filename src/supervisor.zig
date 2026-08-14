@@ -164,6 +164,9 @@ pub const Options = struct {
     base_dir: []const u8,
     /// Where Archives are written.
     log_dir: []const u8,
+    /// What to call this Session on screen. The directory the config was read
+    /// from, which is what a reader has several of open at once.
+    project: []const u8 = "",
     /// Total in-memory Window budget across all Workers.
     ///
     /// Deliberately small. The Window is a cache in front of the Archive, not
@@ -204,6 +207,12 @@ pub const Supervisor = struct {
     signals: os.Signals,
     devnull: os.Fd,
     shell: Probe.ResolvedShell,
+    /// Where this Session's Archives are. Kept so a view can tell the reader
+    /// which file it is looking at — the answer to "can I send you this log?"
+    /// is a path, and it should not be something they have to already know.
+    log_dir: []const u8,
+    /// What this Session is called on screen.
+    project: []const u8,
 
     shutting_down: bool = false,
     /// Set when a Worker with `restart: exit_on_failure` failed. Reported by
@@ -329,6 +338,8 @@ pub const Supervisor = struct {
             .signals = signals,
             .devnull = devnull,
             .shell = .{ .path = shell_path.ptr, .argument = cfg.shell.argument },
+            .log_dir = try arena.dupe(u8, opts.log_dir),
+            .project = try arena.dupe(u8, opts.project),
             // Worst case each Worker contributes an output pipe and a probe
             // socket, plus the signal pipe and room for the caller's own.
             .poll_buf = try arena.alloc(os.PollFd, 2 * n + 8),
