@@ -8,7 +8,38 @@ and internal tidying stay in the git log, which is where they are useful.
 
 ## Unreleased
 
-Nothing yet.
+### The arrow keys mean what they look like
+
+- **`↑` `↓` act on whatever you are in, `→` goes in and `←` comes back out.**
+  In the service list the arrows walk services; in a log they walk lines. They
+  used to be half of one model and half of another — `↑` `↓` scrolled the log
+  while `←` `→` switched service — so neither reading was right.
+- **`v` starts a selection at the line you are on**, not at the top of the
+  screen. Picking a stack trace out of a busy log no longer means scrolling
+  until the line you want happens to be the first one.
+- **`y` with nothing selected copies the line you are on** when you are inside
+  a log; from the service list it still copies the screenful on show.
+- A single click in the log moves the cursor instead of starting a one-line
+  selection, so a stray click cannot leave a selection behind for the next `y`
+  to copy.
+- The footer now changes with where you are, and names the arrow keys. What you
+  can do is on screen rather than behind `?`.
+
+### Logs survive a restart
+
+- **Every run writes to its own directory** — `.devrun/logs/<timestamp>/` — with
+  `.devrun/logs/latest` pointing at the newest. Restarting to reproduce a bug no
+  longer deletes the log of the run you were reproducing.
+- `devrun logs api` and the log pane's title now quote
+  `.devrun/logs/latest/api.log`, which stays true tomorrow.
+- `devrun up` keeps the newest **10** runs and says how many it deleted.
+  `--keep N` changes that; `--keep 0` keeps every one of them.
+- **Quitting offers to delete saved logs** — `y` for all of them, `o` for every
+  run but the one that just finished, Enter to keep. The offer comes after
+  shutdown, so a habitual `q q` still leaves without deleting anything.
+- **`devrun clean`** does the same from a shell, for anyone who leaves by
+  Ctrl-C. `--all` includes the newest run, and is refused while a Session is
+  running.
 
 ## 0.1.0
 

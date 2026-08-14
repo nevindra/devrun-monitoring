@@ -31,6 +31,8 @@ const term = @import("term.zig");
 const control = @import("control.zig");
 const supervisor = @import("supervisor.zig");
 const sample_mod = @import("sample.zig");
+const store = @import("store.zig");
+const config = @import("config.zig");
 
 const Supervisor = supervisor.Supervisor;
 const esc = term.esc;
@@ -70,11 +72,28 @@ const paint = struct {
 
 const Mode = enum { normal, visual };
 
+/// Which of the two places in the view the arrow keys are speaking to.
+///
+/// This is the whole of the navigation model. ↑↓ act on whatever has Focus,
+/// → goes in, ← comes back out — the shape every file manager and mail client
+/// has used for thirty years, so nobody has to be taught it. Before this, ↑↓
+/// scrolled the log and ←→ switched Worker, which is two halves of two
+/// different models and reads as neither.
+const Focus = enum { list, log };
+
+pub const Options = struct {
+    /// How many old Sessions retention deleted on the way in. Reported once,
+    /// in the footer, because deleting somebody's logs without saying so is
+    /// the one thing retention must never do.
+    pruned: usize = 0,
+};
+
 pub fn run(
     gpa: Allocator,
     sup: *Supervisor,
     server: ?*control.Server,
     io: std.Io,
+    opts: Options,
 ) !u8 {
     _ = io;
     var tty = term.Terminal.init(0) catch {
@@ -88,6 +107,13 @@ pub fn run(
 
     ui.enter();
     defer ui.leave();
+
+    if (opts.pruned > 0) {
+        ui.setStatus("", "Removed {d} old log run{s} to stay under --keep", .{
+            opts.pruned,
+            if (opts.pruned == 1) "" else "s",
+        });
+    }
 
     while (true) {
         try ui.render();
@@ -103,18 +129,29 @@ pub fn run(
         if (server) |s| s.service(extra[1..n], sup);
 
         if (extra[0].revents & os.POLL.IN != 0) {
-            if (ui.readKeys()) return ui.exit_code;
+            if (ui.readKeys()) break;
         }
 
-        // The Session is over and the user has not asked to stay.
-        if (sup.done() and sup.shutting_down) return ui.exit_code;
+        // The Session is over and the user has not asked to stay. There may
+        // still be a question to answer before the terminal comes back.
+        if (sup.done() and sup.shutting_down and ui.beginLeaving()) break;
     }
+
+    // Before anything is said about what was deleted, so it is said on the
+    // reader's real screen rather than on one about to be discarded.
+    ui.leave();
+    ui.reportCleaned();
+    return ui.exit_code;
 }
 
 /// What the footer offers and what a click on it does. Named for the thing
 /// that happens, not for the key that triggers it — the key is a shortcut to
 /// the action, not the other way round.
-const Action = enum { copy, next, restart, stop, help, quit };
+///
+/// `label` is the one that does nothing: a chip that names the arrow keys is
+/// there to be read, and there is no click that means "press down". Those get
+/// no click region at all rather than a region that swallows the click.
+const Action = enum { label, copy, pick, next, enter_log, leave_log, restart, stop, help, quit };
 
 const Chip = struct {
     key: []const u8,
@@ -122,25 +159,56 @@ const Chip = struct {
     action: Action,
 
     fn width(self: Chip) usize {
-        return self.key.len + 1 + self.label.len;
+        return term.fitToWidth(self.key, 64).cols + 1 + self.label.len;
     }
 };
 
-/// The control surface, in the order a reader meets it. Copy is first because
-/// it is the job most people opened this for.
-const chips = [_]Chip{
-    .{ .key = "y", .label = "Copy", .action = .copy },
-    .{ .key = "Tab", .label = "Switch", .action = .next },
-    .{ .key = "r", .label = "Restart", .action = .restart },
-    .{ .key = "s", .label = "Stop", .action = .stop },
-    .{ .key = "?", .label = "Keys", .action = .help },
-    .{ .key = "q", .label = "Quit", .action = .quit },
+/// The control surface. Two of them, because the footer's job is to answer
+/// "what can I do *now*" — and the honest answer changes depending on whether
+/// the reader is picking a service or reading its log. One combined bar would
+/// have to advertise both, which is how a key bar becomes wallpaper nobody
+/// reads and everyone ends up in `?` anyway.
+const ChipSet = struct {
+    items: []const Chip,
+    /// Which chips give up their columns first on a narrow terminal, least
+    /// useful first. What is left when everything sheddable is gone must still
+    /// be enough to get somewhere: how to move, and how to get out.
+    drop: []const usize,
 };
 
-/// Which chips give up their columns first on a narrow terminal, least useful
-/// first. Copy, Keys and Quit are never dropped: the first is the point of the
-/// view, and the other two are how someone gets un-stuck.
-const chip_drop_order = [_]usize{ 3, 2, 1 };
+const list_chips: ChipSet = .{
+    .items = &.{
+        .{ .key = "↑↓", .label = "Process", .action = .next },
+        .{ .key = "→", .label = "Open log", .action = .enter_log },
+        .{ .key = "r", .label = "Restart", .action = .restart },
+        .{ .key = "s", .label = "Stop", .action = .stop },
+        .{ .key = "?", .label = "Keys", .action = .help },
+        .{ .key = "q", .label = "Quit", .action = .quit },
+    },
+    // Stop, then Restart, then the way into the log — which goes last of the
+    // three because → is the only key that is genuinely new here. Moving
+    // between processes, the full key list and the way out are never dropped.
+    .drop = &.{ 3, 2, 1 },
+};
+
+const log_chips: ChipSet = .{
+    .items = &.{
+        .{ .key = "↑↓", .label = "Line", .action = .label },
+        .{ .key = "v", .label = "Select", .action = .pick },
+        .{ .key = "y", .label = "Copy", .action = .copy },
+        .{ .key = "←", .label = "Back", .action = .leave_log },
+        .{ .key = "?", .label = "Keys", .action = .help },
+        .{ .key = "q", .label = "Quit", .action = .quit },
+    },
+    // The line hint first, since it is the one chip that is only a caption;
+    // then Select, then Back, which Esc also does and the message on the left
+    // says so. Copy never goes: it is what the view is for.
+    .drop = &.{ 0, 1, 3 },
+};
+
+/// Room for the widest set, so the click regions can be indexed by position
+/// in whichever set is showing.
+const max_chips = @max(list_chips.items.len, log_chips.items.len);
 
 /// How the screen is divided this frame. Recomputed rather than stored,
 /// because it is arithmetic over the terminal size and a stale copy of it is a
@@ -214,29 +282,104 @@ const Layout = struct {
     }
 };
 
+const HelpRow = struct { key: []const u8 = "", text: []const u8 = "", head: bool = false };
+
+/// Everything the view can do, spelled out — the list `?` opens.
+///
+/// Ordered so that the rows a short terminal loses are the ones that cost
+/// least. Movement comes first because a reader who opened this is usually
+/// lost, and the path where the Archive lives comes after this list because it
+/// is the one line here that is also on screen the whole time the help is
+/// closed, in the log pane's title.
+///
+/// Short enough to fit the screen the help is given — see the test at the foot
+/// of this file, which is what stops a row being added without noticing that
+/// it pushed the last one off.
+const help_rows = [_]HelpRow{
+    .{ .text = "Getting around", .head = true },
+    .{ .key = "↑ ↓", .text = "another service — or another line, in a log" },
+    .{ .key = "→   ←", .text = "into the log, and back out to the list" },
+    .{ .key = "Tab   or   click", .text = "switch service from anywhere" },
+    .{},
+    .{ .text = "Reading the log", .head = true },
+    .{ .key = "j k  or  PgUp PgDn", .text = "a line, or a whole screen" },
+    .{ .key = "Home   End", .text = "the very start, or back to live" },
+    .{},
+    .{ .text = "Taking lines out", .head = true },
+    .{ .key = "y", .text = "copy the line you are on" },
+    .{ .key = "v  then  ↑ ↓", .text = "select a range, then y copies it" },
+    .{ .key = "drag the mouse", .text = "select the lines you drag over" },
+    .{ .key = "Shift + drag", .text = "your terminal's own selection" },
+    .{ .key = "Esc", .text = "let a selection go" },
+    .{},
+    .{ .text = "Services, and leaving", .head = true },
+    .{ .key = "s   r   S", .text = "stop · restart · start this one" },
+    .{ .key = "q", .text = "shut down, then offer to delete old logs" },
+    .{ .key = "q   q", .text = "leave straight away, delete nothing" },
+};
+
+/// The rows the help gets on a terminal of `rows`: everything between the
+/// Session line and the footer, plus its own top border.
+fn helpHeight(rows: usize) usize {
+    return rows -| 3;
+}
+
+/// The one question the view ever asks. Answering it is the last thing that
+/// happens before the terminal comes back.
+const Prompt = enum {
+    none,
+    /// "There are N runs' worth of logs on disk — delete them?"
+    clean_logs,
+};
+
 const Ui = struct {
     sup: *Supervisor,
     tty: *term.Terminal,
     size: term.Size,
 
-    /// Absolute Archive offset each Worker's pane starts at. One u64 per
-    /// Worker is the whole of the TUI's per-Worker state.
+    /// Absolute Archive offset each Worker's pane starts at.
     view_top: []u64,
-    /// Following the tail rather than parked at a scroll position.
+    /// Where the Cursor is in each Worker's Archive. Kept per Worker so that
+    /// leaving a log and coming back lands where the reader left off rather
+    /// than at the bottom — which is the difference between switching to check
+    /// something and losing your place.
+    cursor: []u64,
+    /// Whether the Cursor is riding the tail. `follow[i]` and "the Cursor is
+    /// on the last line" are the same statement, which is why the Cursor is
+    /// derived rather than stored while it holds.
     follow: []bool,
 
     selected: usize = 0,
+    /// Which pane the arrow keys are speaking to.
+    focus: Focus = .list,
     mode: Mode = .normal,
-    /// First line of the picked range, as an absolute offset.
+    /// The end of the picked range that does not move — the Cursor is the
+    /// other end.
     anchor: u64 = 0,
-    /// Line the cursor is on while picking.
-    cursor: u64 = 0,
+    /// The line the mouse button went down on, which becomes the anchor if the
+    /// press turns out to be a drag.
+    pending_anchor: u64 = 0,
     /// How many lines are currently picked. Cached rather than counted per
     /// frame: the walk is O(lines picked) and the answer only changes when the
     /// reader moves an end of the range.
     picked_lines: usize = 0,
 
     help: bool = false,
+    /// The question asked on the way out, and nothing else. A view with one
+    /// question in it does not need a queue of them.
+    prompt: Prompt = .none,
+    /// What the answer to that question deleted, said once the alternate
+    /// screen is gone — inside it there is nothing left to read it.
+    cleaned: store.Removed = .{},
+    /// Set when the reader is finished and the loop should return.
+    finished: bool = false,
+    /// What is on disk, read once when the question is asked. The figure is
+    /// what makes the question answerable — "delete some logs?" and "delete 12
+    /// runs, 48 MB?" are not the same question.
+    prompt_usage: store.Usage = .{},
+    /// Whether `leave` has already run, so it can be called on the way out
+    /// *and* left as a defer without undoing the terminal twice.
+    left: bool = false,
 
     frame: std.Io.Writer.Allocating,
     gpa: Allocator,
@@ -256,45 +399,74 @@ const Ui = struct {
     status_tone: []const u8 = "",
 
     /// Where each chip was drawn last frame, so a click can be matched back to
-    /// one. Zero means the chip was not shown at this width.
-    chip_col: [chips.len]u16 = @splat(0),
-    chip_w: [chips.len]u16 = @splat(0),
+    /// one. Zero means the chip was not shown at this width — or that it is
+    /// not something a click can mean.
+    chip_col: [max_chips]u16 = @splat(0),
+    chip_w: [max_chips]u16 = @splat(0),
 
     exit_code: u8 = 0,
     /// The longest Worker name, which sets the name column for the Session so
     /// the figures beside it form columns instead of drifting per row.
     widest_name: usize,
+    /// The Archive directory, spelled the way it goes on screen. Built once
+    /// rather than per frame: it never changes, and it is printed in the log
+    /// pane's title on every one of them.
+    log_dir_shown: []const u8,
 
     fn init(gpa: Allocator, sup: *Supervisor, tty: *term.Terminal) !Ui {
         const n = sup.workers.len;
         var widest: usize = 0;
         for (sup.workers) |x| widest = @max(widest, x.name().len);
-        return .{
+        const shown = if (sup.log_root.len > 0)
+            try std.fmt.allocPrint(gpa, "{s}/{s}", .{
+                trimCwdPrefix(sup.log_root),
+                store.latest_link,
+            })
+        else
+            try gpa.dupe(u8, trimCwdPrefix(sup.log_dir));
+        errdefer gpa.free(shown);
+
+        const ui: Ui = .{
+            .log_dir_shown = shown,
             .widest_name = widest,
             .gpa = gpa,
             .sup = sup,
             .tty = tty,
             .size = tty.size(),
             .view_top = try gpa.alloc(u64, n),
+            .cursor = try gpa.alloc(u64, n),
             .follow = try gpa.alloc(bool, n),
             .frame = .init(gpa),
         };
+        // Every Worker starts at its live tail, which for an Archive with
+        // nothing in it yet is offset zero. Done here rather than in `enter`
+        // so that a Ui is a usable value the moment it exists, instead of one
+        // that has to be switched on before it can be asked anything.
+        @memset(ui.view_top, 0);
+        @memset(ui.cursor, 0);
+        @memset(ui.follow, true);
+        return ui;
     }
 
     fn deinit(self: *Ui, gpa: Allocator) void {
         gpa.free(self.view_top);
+        gpa.free(self.cursor);
         gpa.free(self.follow);
+        gpa.free(self.log_dir_shown);
         self.frame.deinit();
     }
 
     fn enter(self: *Ui) void {
-        @memset(self.view_top, 0);
-        @memset(self.follow, true);
         self.tty.enterRaw();
         write(esc.alt_screen_on ++ esc.cursor_hide ++ esc.clear ++ esc.mouse_on);
     }
 
+    /// Puts the terminal back. Idempotent, because the way out runs it early —
+    /// anything the view has left to say is said on the real screen, not on an
+    /// alternate one that is about to be thrown away.
     fn leave(self: *Ui) void {
+        if (self.left) return;
+        self.left = true;
         write(esc.mouse_off ++ esc.alt_screen_off ++ esc.cursor_show ++ esc.reset);
         self.tty.restore();
     }
@@ -406,6 +578,10 @@ const Ui = struct {
     fn onKey(self: *Ui, key: term.Key) bool {
         const height = self.logHeight();
 
+        // The question on the way out takes every key, because every key that
+        // is not an answer would act on a Session that has already stopped.
+        if (self.prompt != .none) return self.answerPrompt(key);
+
         // The help pane is a detour, not a mode: anything that is not "go
         // back" would otherwise act on a view the reader cannot see.
         if (self.help) {
@@ -426,14 +602,18 @@ const Ui = struct {
         switch (key) {
             .char => |c| switch (c) {
                 'q' => return self.requestQuit(),
-                'j' => self.scroll(1),
-                'k' => self.scroll(-1),
-                'g' => self.jumpTop(),
-                'G' => self.jumpBottom(),
+                // Vim's line keys stay, and stay pointed at the log: someone
+                // who types j to read is asking about output, not about which
+                // service is selected. From the list they pull Focus in with
+                // them, so the Cursor they just moved is one they can see.
+                'j' => self.inLog().moveCursor(1),
+                'k' => self.inLog().moveCursor(-1),
+                'g' => self.inLog().jumpTop(),
+                'G' => self.inLog().jumpBottom(),
                 'n' => self.selectBy(1),
                 'p' => self.selectBy(-1),
                 '\t' => self.selectBy(1),
-                'v' => self.togglePick(),
+                'v' => self.inLog().togglePick(),
                 'y' => self.copy(),
                 's' => self.act(.stop),
                 'r' => self.act(.restart),
@@ -441,25 +621,73 @@ const Ui = struct {
                 '?' => self.help = true,
                 else => {},
             },
-            .down => if (self.mode == .visual) self.moveCursor(1) else self.scroll(1),
-            .up => if (self.mode == .visual) self.moveCursor(-1) else self.scroll(-1),
-            .right => self.selectBy(1),
-            .left => self.selectBy(-1),
-            .page_down => self.scroll(@intCast(height)),
-            .page_up => self.scroll(-@as(isize, @intCast(height))),
-            .home => self.jumpTop(),
-            .end => self.jumpBottom(),
-            .escape => self.clearPick(),
+
+            // The whole navigation model, in four lines. ↑↓ act on whatever
+            // has Focus; → goes in and ← comes back out.
+            .down => switch (self.focus) {
+                .list => self.selectBy(1),
+                .log => self.moveCursor(1),
+            },
+            .up => switch (self.focus) {
+                .list => self.selectBy(-1),
+                .log => self.moveCursor(-1),
+            },
+            .right => self.enterLog(),
+            .left => self.leaveLog(),
+
+            // A page is a log gesture whichever pane has Focus, so it brings
+            // Focus with it rather than doing nothing.
+            .page_down => self.inLog().scroll(@intCast(height)),
+            .page_up => self.inLog().scroll(-@as(isize, @intCast(height))),
+
+            // These two are the ends of whatever the reader is moving through:
+            // the list of services, or the log.
+            .home => switch (self.focus) {
+                .list => self.selectTo(0),
+                .log => self.jumpTop(),
+            },
+            .end => switch (self.focus) {
+                .list => self.selectTo(self.sup.workers.len -| 1),
+                .log => self.jumpBottom(),
+            },
+
+            // Layered, so the key someone presses when they want out of
+            // something always gets them out of exactly one thing.
+            .escape => if (self.mode == .visual) self.clearPick() else self.leaveLog(),
             .mouse => |m| return self.onMouse(m),
             else => {},
         }
         return false;
     }
 
+    /// Pulls Focus into the log and hands back `self`, so a key that only
+    /// makes sense against a log reads as `self.inLog().moveCursor(1)`.
+    fn inLog(self: *Ui) *Ui {
+        self.focus = .log;
+        return self;
+    }
+
+    fn enterLog(self: *Ui) void {
+        self.focus = .log;
+    }
+
+    /// Back to the list, letting go of a picked range on the way. Leaving a
+    /// selection behind in a pane the reader has stepped out of is how `y`
+    /// ends up copying something they cannot see.
+    fn leaveLog(self: *Ui) void {
+        self.clearPick();
+        self.focus = .list;
+    }
+
     /// First press asks politely; the Session shuts down and the view stays up
-    /// so the reader can watch it happen. Second press stops waiting.
+    /// so the reader can watch it happen. Second press stops waiting — and
+    /// skips the question about logs, because someone pressing q twice is
+    /// telling us they are done being asked things.
     fn requestQuit(self: *Ui) bool {
-        if (self.sup.shutting_down) return true;
+        if (self.sup.shutting_down) {
+            self.finished = true;
+            return true;
+        }
         self.sup.beginShutdown();
         self.setStatus("", "Shutting everything down — press q again to leave now", .{});
         return false;
@@ -469,35 +697,57 @@ const Ui = struct {
         const n = self.sup.workers.len;
         if (n == 0) return;
         const cur: isize = @intCast(self.selected);
-        self.selected = @intCast(@mod(cur + delta, @as(isize, @intCast(n))));
+        self.selectTo(@intCast(@mod(cur + delta, @as(isize, @intCast(n)))));
+    }
+
+    fn selectTo(self: *Ui, i: usize) void {
+        if (i >= self.sup.workers.len) return;
+        self.selected = i;
         self.clearPick();
     }
 
-    /// Moves the view by whole lines. Leaving the bottom stops following, and
-    /// arriving back at the bottom resumes it — so a reader who scrolls up to
-    /// read something is not yanked away by the next line of output.
+    /// Turns a followed view into a parked one, freezing the derived Cursor
+    /// and pane top into the stored ones first.
+    ///
+    /// Every movement that is not "go back to live" starts here, so nothing
+    /// downstream has to ask whether the numbers it is reading are the stored
+    /// ones or the ones the tail implies.
+    fn unfollow(self: *Ui, i: usize) void {
+        if (!self.follow[i]) return;
+        self.view_top[i] = self.viewTop(i);
+        self.cursor[i] = self.cursorAt(i);
+        self.follow[i] = false;
+    }
+
+    /// Moves the view by whole lines, dragging the Cursor along by its edge.
+    ///
+    /// The Cursor is never off the pane. `y` copies the line it is on, so a
+    /// Cursor scrolled out of sight is a copy of something the reader cannot
+    /// see — which is the bug this whole model exists to remove.
     fn scroll(self: *Ui, lines: isize) void {
         const i = self.selected;
         const a = &self.sup.workers[i].archive;
-        if (lines < 0) {
-            self.view_top[i] = a.scrollBack(self.viewTop(i), @intCast(-lines));
-            self.follow[i] = false;
-        } else {
-            const moved = a.scrollForward(self.viewTop(i), @intCast(lines));
-            self.view_top[i] = moved;
-            // At the last line, following resumes.
-            if (moved >= a.lastLineStart()) self.follow[i] = true;
-        }
-        if (self.mode == .visual) self.clampCursor();
+        self.unfollow(i);
+        self.view_top[i] = if (lines < 0)
+            a.scrollBack(self.view_top[i], @intCast(-lines))
+        else
+            a.scrollForward(self.view_top[i], @intCast(lines));
+        self.clampCursorToView();
     }
 
     fn jumpTop(self: *Ui) void {
-        self.view_top[self.selected] = 0;
-        self.follow[self.selected] = false;
+        const i = self.selected;
+        self.unfollow(i);
+        self.view_top[i] = 0;
+        self.cursor[i] = 0;
+        self.refreshPick();
     }
 
+    /// Back to live: the Cursor rides the tail again, which is the same
+    /// statement as `follow`.
     fn jumpBottom(self: *Ui) void {
         self.follow[self.selected] = true;
+        self.refreshPick();
     }
 
     /// Where the pane starts. While following, that is derived from the
@@ -509,17 +759,31 @@ const Ui = struct {
         return a.scrollBack(a.lastLineStart(), self.logHeight() - 1);
     }
 
+    /// Where the Cursor is. Derived while following, for the same reason the
+    /// pane top is: a Worker printing a line must not have to tell the view
+    /// where the newest line now starts.
+    fn cursorAt(self: *Ui, i: usize) u64 {
+        const a = &self.sup.workers[i].archive;
+        if (self.follow[i]) return a.lastLineStart();
+        return @min(self.cursor[i], a.lastLineStart());
+    }
+
     /// The absolute offset of the line drawn on body row `row`.
     fn lineAtRow(self: *Ui, row: usize) u64 {
         const a = &self.sup.workers[self.selected].archive;
         return a.scrollForward(self.viewTop(self.selected), row);
     }
 
+    /// Starts a picked range at the Cursor.
+    ///
+    /// At the Cursor, not at the top of the pane. Anchoring at the top is what
+    /// made `v` on a screen of output pick a line the reader had not chosen
+    /// and was not looking at — the range began wherever the pane happened to
+    /// be scrolled to, which is a fact about the view, not about them.
     fn togglePick(self: *Ui) void {
         if (self.mode == .visual) return self.clearPick();
         self.mode = .visual;
-        self.anchor = self.viewTop(self.selected);
-        self.cursor = self.anchor;
+        self.anchor = self.cursorAt(self.selected);
         self.refreshPick();
     }
 
@@ -529,31 +793,45 @@ const Ui = struct {
         self.status_len = 0;
     }
 
+    /// Moves the Cursor, scrolling the pane only when the Cursor would leave
+    /// it. Reaching the last line puts the view back on the tail, so reading
+    /// down to live output and staying there needs no second keypress.
     fn moveCursor(self: *Ui, delta: isize) void {
-        const a = &self.sup.workers[self.selected].archive;
-        self.cursor = if (delta < 0)
-            a.scrollBack(self.cursor, @intCast(-delta))
+        const i = self.selected;
+        const a = &self.sup.workers[i].archive;
+        self.unfollow(i);
+        self.cursor[i] = if (delta < 0)
+            a.scrollBack(self.cursor[i], @intCast(-delta))
         else
-            a.scrollForward(self.cursor, @intCast(delta));
+            a.scrollForward(self.cursor[i], @intCast(delta));
 
-        // Following the cursor off the pane scrolls the pane.
-        const top = self.viewTop(self.selected);
-        if (self.cursor < top) {
-            self.view_top[self.selected] = self.cursor;
-            self.follow[self.selected] = false;
+        const top = self.view_top[i];
+        if (self.cursor[i] < top) {
+            self.view_top[i] = self.cursor[i];
         } else {
             const bottom = a.scrollForward(top, self.logHeight() - 1);
-            if (self.cursor > bottom) {
-                self.view_top[self.selected] = a.scrollForward(top, 1);
-                self.follow[self.selected] = false;
+            if (self.cursor[i] > bottom) {
+                // Scroll by exactly the overshoot rather than by one line: a
+                // page-sized move must not walk the pane down a line at a
+                // time, and a one-line move is the overshoot of one.
+                self.view_top[i] = a.scrollBack(
+                    self.cursor[i],
+                    self.logHeight() - 1,
+                );
             }
         }
+        if (self.cursor[i] >= a.lastLineStart()) self.follow[i] = true;
         self.refreshPick();
     }
 
-    fn clampCursor(self: *Ui) void {
-        const a = &self.sup.workers[self.selected].archive;
-        self.cursor = @min(self.cursor, a.lastLineStart());
+    /// Pulls the Cursor back onto the pane after the view moved under it.
+    fn clampCursorToView(self: *Ui) void {
+        const i = self.selected;
+        const a = &self.sup.workers[i].archive;
+        const top = self.viewTop(i);
+        const bottom = a.scrollForward(top, self.logHeight() - 1);
+        self.cursor[i] = std.math.clamp(self.cursorAt(i), top, bottom);
+        if (self.cursor[i] >= a.lastLineStart()) self.follow[i] = true;
         self.refreshPick();
     }
 
@@ -566,9 +844,10 @@ const Ui = struct {
             self.picked_lines = 0;
             return;
         }
+        const cursor = self.cursorAt(self.selected);
         self.picked_lines = self.countLines(
-            @min(self.anchor, self.cursor),
-            @max(self.anchor, self.cursor),
+            @min(self.anchor, cursor),
+            @max(self.anchor, cursor),
         );
         self.status_len = 0;
     }
@@ -628,8 +907,8 @@ const Ui = struct {
                 if (on_service) {
                     const i = self.serviceTop(lay.service_rows) + (m.row - lay.service_first);
                     if (i < self.sup.workers.len) {
-                        self.selected = i;
-                        self.clearPick();
+                        self.selectTo(i);
+                        self.focus = .list;
                     }
                     return false;
                 }
@@ -637,15 +916,28 @@ const Ui = struct {
                 // line. Not a miss to report, just nothing to do.
                 if (in_table) return false;
                 if (!in_log) return false;
+                // A click puts the Cursor here and nothing more. It used to
+                // start a one-line pick, which meant a stray click left a
+                // selection behind and the next `y` copied that instead of
+                // what the reader was looking at.
                 const line = self.lineAtRow(m.row - lay.log_first);
-                self.mode = .visual;
-                self.anchor = line;
-                self.cursor = line;
-                self.refreshPick();
+                self.focus = .log;
+                self.clearPick();
+                self.moveCursorTo(line);
+                self.pending_anchor = line;
             },
 
             .drag => {
-                if (self.mode != .visual) return false;
+                // A drag is a pick, and it starts where the button went down.
+                // Deferred to here rather than done on press so that clicking
+                // and dragging are different gestures rather than the same one
+                // with different lengths.
+                if (self.mode != .visual) {
+                    if (!in_log) return false;
+                    self.mode = .visual;
+                    self.anchor = self.pending_anchor;
+                    self.refreshPick();
+                }
                 // Dragging past an edge keeps going, which is how a range
                 // longer than the pane gets picked at all.
                 if (m.row <= lay.log_first) {
@@ -655,8 +947,7 @@ const Ui = struct {
                 }
                 const last: i32 = @intCast(lay.log_rows - 1);
                 const row = std.math.clamp(@as(i32, m.row) - @as(i32, lay.log_first), 0, last);
-                self.cursor = self.lineAtRow(@intCast(row));
-                self.refreshPick();
+                self.moveCursorTo(self.lineAtRow(@intCast(row)));
             },
 
             .release => {},
@@ -664,18 +955,43 @@ const Ui = struct {
         return false;
     }
 
+    /// Puts the Cursor on a line the reader pointed at, which by construction
+    /// is already on the pane — so unlike `moveCursor` this never scrolls.
+    fn moveCursorTo(self: *Ui, line: u64) void {
+        const i = self.selected;
+        const a = &self.sup.workers[i].archive;
+        self.unfollow(i);
+        self.cursor[i] = line;
+        if (line >= a.lastLineStart()) self.follow[i] = true;
+        self.refreshPick();
+    }
+
     fn clickFooter(self: *Ui, col: u16) bool {
-        for (chips, 0..) |c, i| {
+        const set = self.chipSet();
+        for (set.items, 0..) |c, i| {
             const start = self.chip_col[i];
             if (start == 0) continue;
             if (col >= start and col < start + self.chip_w[i]) {
                 return switch (c.action) {
+                    .label => false,
                     .copy => blk: {
                         self.copy();
                         break :blk false;
                     },
+                    .pick => blk: {
+                        self.inLog().togglePick();
+                        break :blk false;
+                    },
                     .next => blk: {
                         self.selectBy(1);
+                        break :blk false;
+                    },
+                    .enter_log => blk: {
+                        self.enterLog();
+                        break :blk false;
+                    },
+                    .leave_log => blk: {
+                        self.leaveLog();
                         break :blk false;
                     },
                     .restart => blk: {
@@ -695,6 +1011,65 @@ const Ui = struct {
             }
         }
         return false;
+    }
+
+    // ------------------------------------------------------------- leaving
+
+    /// Called once the Session has stopped and the reader asked to leave.
+    /// Returns true when there is nothing left to do but go.
+    ///
+    /// The offer to delete logs is made *here* rather than on the first `q`,
+    /// and that ordering is the whole design. `q q` is already muscle memory
+    /// for "shut down and get out"; a question that appears on the first press
+    /// would read the second one as its answer, and the answer next to `q` on
+    /// most people's mental map is "yes". Deleting somebody's logs because
+    /// they typed the thing they always type is not a prompt, it is a trap.
+    fn beginLeaving(self: *Ui) bool {
+        if (self.finished) return true;
+        if (self.prompt != .none) return false;
+        if (self.sup.log_root.len == 0) return true;
+
+        const use = store.usage(self.gpa, self.sup.log_root);
+        if (use.sessions == 0) return true;
+        self.prompt_usage = use;
+        self.prompt = .clean_logs;
+        self.sup.generation += 1;
+        return false;
+    }
+
+    /// Says what the answer deleted, on the terminal the reader is left
+    /// looking at. A count that only ever appeared inside the alternate screen
+    /// would be a count nobody saw.
+    fn reportCleaned(self: *Ui) void {
+        if (self.cleaned.sessions == 0) return;
+        var size_buf: [32]u8 = undefined;
+        var line_buf: [160]u8 = undefined;
+        const line = std.fmt.bufPrint(&line_buf, "devrun: deleted {d} log run{s} ({s})\n", .{
+            self.cleaned.sessions,
+            if (self.cleaned.sessions == 1) "" else "s",
+            humanBytes(&size_buf, self.cleaned.bytes),
+        }) catch return;
+        write(line);
+    }
+
+    fn answerPrompt(self: *Ui, key: term.Key) bool {
+        const root = self.sup.log_root;
+        switch (key) {
+            .char => |c| switch (c) {
+                'y', 'Y' => self.cleaned = store.clean(self.gpa, root, .all),
+                'o', 'O' => self.cleaned = store.clean(self.gpa, root, .older),
+                // Everything else that is a plain key means "no". A reader who
+                // hits something unexpected at this point gets to keep their
+                // logs, which is the answer that can still be changed later.
+                else => {},
+            },
+            // Enter is the default, and the default is keep.
+            .escape, .enter => {},
+            else => return false,
+        }
+        self.prompt = .none;
+        self.finished = true;
+        return true;
     }
 
     // ------------------------------------------------------------- acting
@@ -729,37 +1104,70 @@ const Ui = struct {
         return self.status_buf[0..self.status_len];
     }
 
-    /// The Archive directory as a reader would type it. A Session started in
-    /// the current directory builds its paths from ".", and "./.devrun/logs"
-    /// is a path with a stutter in it that nobody would write down.
+    /// The Archive directory as a reader would type it.
+    ///
+    /// Through the `latest` symlink rather than through this Session's stamped
+    /// directory. Both name the same file while the Session is running, and
+    /// the point of putting a path on screen is that somebody types or pastes
+    /// it — `.devrun/logs/latest/api.log` is a path a person can retype, and
+    /// `.devrun/logs/2026-08-14T10-32-05Z/api.log` is one they will get wrong.
+    ///
+    /// A Session started in the current directory builds its paths from ".",
+    /// and "./.devrun/logs" is a path with a stutter in it that nobody would
+    /// write down, hence `trimCwdPrefix`.
     fn logDir(self: *const Ui) []const u8 {
-        return trimCwdPrefix(self.sup.log_dir);
+        return self.log_dir_shown;
     }
 
     // ------------------------------------------------------------- copy
 
     /// Produces an Excerpt and hands it to the terminal over OSC 52.
     ///
-    /// Its shape is decided by the view it was taken from, per CONTEXT.md:
-    /// with lines picked it is those lines, otherwise it is exactly what is on
-    /// screen. There is no setting, because there is no second answer a reader
-    /// would want.
+    /// Its shape is decided by the view it was taken from, per CONTEXT.md, and
+    /// there are three views to be taken from:
+    ///
+    ///   - lines picked → those lines
+    ///   - Focus on the log → the line the Cursor is on
+    ///   - Focus on the list → the screenful of log on show
+    ///
+    /// The middle one is the reason the Cursor exists. Copying the screen
+    /// while a Cursor is drawn on one line of it invites the reader to believe
+    /// the Cursor decided what was copied, and being wrong about what is on
+    /// your clipboard is only discovered after you have pasted it somewhere.
+    /// Which lines an Excerpt would be made of, as the offset of its first
+    /// line and the offset of its last.
+    ///
+    /// Separate from `copy` so that what gets copied can be asserted without a
+    /// terminal on the other end: the decision is the interesting part, and
+    /// `copy` past this point is byte-shovelling.
+    fn excerptRange(self: *Ui) struct { first: u64, last: u64 } {
+        const i = self.selected;
+        const a = &self.sup.workers[i].archive;
+        if (self.mode == .visual) {
+            const cursor = self.cursorAt(i);
+            return .{
+                .first = @min(self.anchor, cursor),
+                .last = @max(self.anchor, cursor),
+            };
+        }
+        if (self.focus == .log) {
+            const cursor = self.cursorAt(i);
+            return .{ .first = cursor, .last = cursor };
+        }
+        const top = self.viewTop(i);
+        // The last line *on the pane*, which is not the last row when the
+        // Worker has printed less than a screenful. Reporting the row count
+        // there would promise more lines than went to the clipboard.
+        return .{ .first = top, .last = a.scrollForward(top, self.logHeight() - 1) };
+    }
+
     fn copy(self: *Ui) void {
         const i = self.selected;
         const a = &self.sup.workers[i].archive;
 
-        var from: u64 = undefined;
-        var last: u64 = undefined;
-        if (self.mode == .visual) {
-            from = @min(self.anchor, self.cursor);
-            last = @max(self.anchor, self.cursor);
-        } else {
-            from = self.viewTop(i);
-            // The last line *on the pane*, which is not the last row when the
-            // Worker has printed less than a screenful. Reporting the row
-            // count there would promise more lines than went to the clipboard.
-            last = a.scrollForward(from, self.logHeight() - 1);
-        }
+        const range = self.excerptRange();
+        var from = range.first;
+        const last = range.last;
         const to = a.lineEnd(last);
         const lines = if (self.mode == .visual) self.picked_lines else self.countLines(from, last);
 
@@ -838,7 +1246,7 @@ const Ui = struct {
         try w.writeAll(esc.home);
         try self.sessionLine(w);
         if (self.help) {
-            try self.helpPane(w, lay);
+            try self.helpPane(w);
         } else {
             try self.table(w, lay);
             try self.logPane(w, lay);
@@ -1154,29 +1562,48 @@ const Ui = struct {
         const i = self.selected;
         const a = &self.sup.workers[i].archive;
 
+        // The Focus mark in the title. Focus has to be visible from across the
+        // screen or the arrow keys become a guess, and the box that has it is
+        // the honest place to say so.
         var title_buf: [320]u8 = undefined;
-        const title = std.fmt.bufPrint(&title_buf, "{s}{s}{s}  {s}{s}/{s}.log{s}", .{
-            esc.bold,           self.sup.workers[i].name(), esc.weight_off,
-            esc.dim,            self.logDir(),
-            self.sup.workers[i].name(), esc.weight_off,
+        const title = std.fmt.bufPrint(&title_buf, "{s}{s}{s}{s}  {s}{s}/{s}.log{s}", .{
+            if (self.focus == .log) paint.picked ++ "▸ " else "  ",
+            esc.bold,
+            self.sup.workers[i].name(),
+            esc.weight_off,
+            esc.dim,
+            self.logDir(),
+            self.sup.workers[i].name(),
+            esc.weight_off,
         }) catch self.sup.workers[i].name();
         try rule(w, cols, "├", "┤", title, "");
 
         var at = self.viewTop(i);
-        const lo = @min(self.anchor, self.cursor);
-        const hi = @max(self.anchor, self.cursor);
+        const cursor = self.cursorAt(i);
+        const lo = @min(self.anchor, cursor);
+        const hi = @max(self.anchor, cursor);
 
         var line_buf: [8192]u8 = undefined;
         var row: usize = 0;
         while (row < lay.log_rows) : (row += 1) {
             try w.writeAll(esc.dim ++ "│" ++ esc.reset);
 
-            // The margin, and the mark that lives in it. Picked lines are
-            // flagged from the margin rather than by reversing the line: a
-            // Worker's own colours are the reason the Archive is kept
-            // byte-faithful, and highlighting over the top would spend them.
+            // The margin, and the two marks that live in it. Both are flagged
+            // from the margin rather than by reversing the line: a Worker's
+            // own colours are the reason the Archive is kept byte-faithful,
+            // and highlighting over the top would spend them.
+            //
+            // A span and a point, drawn as a span and a point. `▌` is every
+            // line that would be copied; `▸` is the one line the Cursor is on,
+            // and it wins the row because it is the thing that moves — losing
+            // sight of it inside a long picked range is losing sight of which
+            // end of the range the next keypress grows.
             const has_line = at < a.len();
-            if (has_line and self.mode == .visual and at >= lo and at <= hi) {
+            const picked = has_line and self.mode == .visual and at >= lo and at <= hi;
+            const on_cursor = has_line and self.focus == .log and at == cursor;
+            if (on_cursor) {
+                try w.writeAll(paint.picked ++ "▸" ++ esc.reset ++ " ");
+            } else if (picked) {
                 try w.writeAll(paint.picked ++ "▌" ++ esc.reset ++ " ");
             } else {
                 try w.writeAll("  ");
@@ -1204,16 +1631,30 @@ const Ui = struct {
     /// The footer is the control surface, and it does not move. Whatever the
     /// view has to say goes on the left; the actions stay pinned right, so the
     /// place a reader clicked once is the place it is next time.
+    /// Which control surface is on show. The list's and the log's, because
+    /// what a reader can usefully do is different in each — see `ChipSet`.
+    fn chipSet(self: *const Ui) ChipSet {
+        return switch (self.focus) {
+            .list => list_chips,
+            .log => log_chips,
+        };
+    }
+
     fn footer(self: *Ui, w: *std.Io.Writer) !void {
         const cols: usize = self.size.cols;
+        const set = self.chipSet();
 
-        var shown: [chips.len]bool = @splat(true);
+        // The question takes the whole line. Leaving the chips up beside it
+        // would offer `q Quit` as a thing to press while the view is asking
+        // something else, and a key that means two things at once means
+        // neither.
+        var shown: [max_chips]bool = @splat(self.prompt == .none);
         var dropped: usize = 0;
-        var chips_w = chipsWidth(shown);
-        while (hint_floor + 2 + chips_w > cols and dropped < chip_drop_order.len) {
-            shown[chip_drop_order[dropped]] = false;
+        var chips_w = chipsWidth(set, shown);
+        while (hint_floor + 2 + chips_w > cols and dropped < set.drop.len) {
+            shown[set.drop[dropped]] = false;
             dropped += 1;
-            chips_w = chipsWidth(shown);
+            chips_w = chipsWidth(set, shown);
         }
         const chips_start = cols -| chips_w;
 
@@ -1235,15 +1676,20 @@ const Ui = struct {
         try w.splatByteAll(' ', chips_start -| used);
         used = chips_start;
 
-        for (chips, 0..) |c, i| {
+        for (set.items, 0..) |c, i| {
             if (!shown[i]) continue;
             if (used > chips_start) {
                 try w.writeAll("  ");
                 used += 2;
             }
-            // The terminal counts from one, and so does a mouse report.
-            self.chip_col[i] = @intCast(used + 1);
-            self.chip_w[i] = @intCast(c.width());
+            // The terminal counts from one, and so does a mouse report. A chip
+            // that is only a label gets no region at all: a click that lands
+            // on it should fall through to nothing, not be swallowed by a
+            // target that does nothing.
+            if (c.action != .label) {
+                self.chip_col[i] = @intCast(used + 1);
+                self.chip_w[i] = @intCast(c.width());
+            }
             try w.print("{s}{s}{s} {s}", .{ esc.dim, c.key, esc.weight_off, c.label });
             used += c.width();
         }
@@ -1252,7 +1698,15 @@ const Ui = struct {
     }
 
     /// Room the left side of the footer is never squeezed out of.
-    const hint_floor = 30;
+    ///
+    /// Set by the longest of the short forms `hint` can fall back to — "↑↓
+    /// moves a line, v starts a selection, y copies it" shrinks to "↑↓ line · v
+    /// select · y copy", which is 27 columns. It was 30 for no reason anybody
+    /// wrote down, and at exactly 80 columns those three spare columns were
+    /// enough to push the log's `↑↓ Line` chip off the footer — dropping the
+    /// one hint that the whole arrow-key change exists to advertise, at the
+    /// width most terminals open at.
+    const hint_floor = 28;
 
     /// What the view has to say, in the order a reader needs to hear it. What
     /// just happened outranks what is true, which outranks what they could do
@@ -1262,6 +1716,20 @@ const Ui = struct {
     /// clipped by the column budget stops mid-word and reads as a bug; a
     /// shorter sentence that fits reads as the thing it says.
     fn hint(self: *Ui, buf: []u8, room: usize) []const u8 {
+        if (self.prompt == .clean_logs) {
+            var size_buf: [32]u8 = undefined;
+            const size = humanBytes(&size_buf, self.prompt_usage.bytes);
+            const n = self.prompt_usage.sessions;
+            const long = std.fmt.bufPrint(
+                buf,
+                "{d} run{s} of logs on disk ({s}) — y delete all · o delete older · Enter keep",
+                .{ n, if (n == 1) "" else "s", size },
+            ) catch return "Delete saved logs? y all · o older · Enter keep";
+            if (!term.fitToWidth(long, room).truncated) return long;
+            const half = buf.len / 2;
+            return std.fmt.bufPrint(buf[half..], "{d} runs of logs ({s}) — y all · o older · Enter keep", .{ n, size }) catch
+                "Delete saved logs? y all · o older · Enter keep";
+        }
         if (self.help) return pick(room, "Press Esc to go back to the log", "Esc goes back");
         if (self.status_len > 0) return shedClause(self.status(), room);
         if (self.sup.shutting_down) {
@@ -1287,14 +1755,26 @@ const Ui = struct {
                 "Paused — End for live",
             );
         }
-        return pick(room, "Drag across the log to pick lines to copy", "Drag to pick lines");
+        // What to say when nothing has happened yet is what to do next, and
+        // that depends on where the reader is standing.
+        return switch (self.focus) {
+            .list => pick(
+                room,
+                "↑↓ picks a process, → opens its log",
+                "↑↓ process · → log",
+            ),
+            .log => pick(
+                room,
+                "↑↓ moves a line, v starts a selection, y copies it",
+                "↑↓ line · v select · y copy",
+            ),
+        };
     }
 
     /// Everything the view can do, spelled out. It exists so the footer does
     /// not have to be a key map: a reader who needs the whole list asks for it
     /// once, and the rest of the time gets a line of plain English instead.
-    fn helpPane(self: *Ui, w: *std.Io.Writer, lay: Layout) !void {
-        const Row = struct { key: []const u8 = "", text: []const u8 = "", head: bool = false };
+    fn helpPane(self: *Ui, w: *std.Io.Writer) !void {
         const key_col = 21;
 
         var path_buf: [256]u8 = undefined;
@@ -1303,34 +1783,17 @@ const Ui = struct {
             self.sup.workers[self.selected].name(),
         }) catch "the .devrun/logs directory";
 
-        const rows = [_]Row{
-            .{ .text = "Reading the log", .head = true },
-            .{ .key = "↑ ↓   or   j k", .text = "scroll a line at a time" },
-            .{ .key = "PgUp  PgDn", .text = "scroll a whole screen" },
-            .{ .key = "Home", .text = "jump to the very start" },
-            .{ .key = "End", .text = "jump back to live output" },
+        const rows = help_rows ++ [_]HelpRow{
             .{},
-            .{ .text = "Taking lines out", .head = true },
-            .{ .key = "drag the mouse", .text = "pick the lines you drag over" },
-            .{ .key = "v  then  ↑ ↓", .text = "pick lines from the keyboard" },
-            .{ .key = "y", .text = "copy what you picked, or the screen" },
-            .{ .key = "Esc", .text = "let the picked lines go" },
-            .{},
-            .{ .text = "Services", .head = true },
-            .{ .key = "Tab   or   click", .text = "switch to another service" },
-            .{ .key = "s   r   S", .text = "stop · restart · start this one" },
-            .{},
-            .{ .text = "Leaving", .head = true },
-            .{ .key = "q", .text = "shut everything down; q again to leave" },
-            .{},
-            .{ .text = "Every log is a plain file. This one is being written to", .head = true },
+            .{ .text = "This log is a plain file, being written to", .head = true },
             .{ .text = path, .head = true },
         };
 
-        // The help takes the table's rows as well as the log's: it is a
-        // detour, not a panel, and the list is worth reading in one piece.
+        // The help takes the whole screen between the Session line and the
+        // footer — every row it can get, because it is a detour rather than a
+        // panel and the list is worth reading in one piece.
         const cols: usize = self.size.cols;
-        const height = lay.service_rows + lay.log_rows + 1;
+        const height = helpHeight(self.size.rows);
         try rule(w, cols, "┌", "┐", "keys", esc.bold);
 
         var drawn: usize = 0;
@@ -1491,10 +1954,10 @@ fn pick(room: usize, long: []const u8, short: []const u8) []const u8 {
     return if (term.fitToWidth(long, room).truncated) short else long;
 }
 
-fn chipsWidth(shown: [chips.len]bool) usize {
+fn chipsWidth(set: ChipSet, shown: [max_chips]bool) usize {
     var total: usize = 0;
     var n: usize = 0;
-    for (chips, 0..) |c, i| {
+    for (set.items, 0..) |c, i| {
         if (!shown[i]) continue;
         total += c.width();
         n += 1;
@@ -1580,7 +2043,7 @@ fn loadColour(cpu: f32) []const u8 {
 /// control socket still reports exact bytes, so nothing that *parses* devrun
 /// ever sees a rounded figure — this rounding is for the one reader who is
 /// going to glance at it and decide whether to care.
-fn humanBytes(buf: []u8, n: u64) []const u8 {
+pub fn humanBytes(buf: []u8, n: u64) []const u8 {
     const units = [_][]const u8{ "B", "kB", "MB", "GB", "TB", "PB", "EB" };
 
     // The step is 999.5 rather than 1000 so a figure that would *round* to
@@ -1622,6 +2085,379 @@ fn write(bytes: []const u8) void {
 // ------------------------------------------------------------- tests
 
 const testing = std.testing;
+
+// ------------------------------------------------------- navigating
+
+/// A Ui over two Workers whose Archives are filled by hand.
+///
+/// No processes are spawned: what is under test is where the Cursor goes, and
+/// a `sh -c` that prints the lines would only add a way for the test to be
+/// flaky. The Supervisor is real, though — the Archives it makes are the ones
+/// the Ui reads through.
+const Fixture = struct {
+    cfg: config.Config,
+    sup: Supervisor,
+    tty: term.Terminal,
+    ui: Ui,
+    dir: []u8,
+    /// Stands in for `.devrun/logs` — the directory the Sessions live under.
+    root: []u8,
+    gpa: Allocator,
+
+    fn init(gpa: Allocator, lines: usize) !*Fixture {
+        const self = try gpa.create(Fixture);
+        errdefer gpa.destroy(self);
+
+        self.gpa = gpa;
+        self.dir = try std.fmt.allocPrint(gpa, "/tmp/devrun-ui-test-{d}", .{os.nowMs()});
+        try os.makePath(self.dir);
+        self.root = try std.fmt.allocPrint(gpa, "{s}/logs", .{self.dir});
+        try os.makePath(self.root);
+
+        var threaded: std.Io.Threaded = .init(gpa, .{});
+        defer threaded.deinit();
+        var environ: std.process.Environ.Map = .init(gpa);
+        defer environ.deinit();
+        try environ.put("PATH", "/usr/local/bin:/usr/bin:/bin");
+
+        self.cfg = try config.loadSource(gpa,
+            \\processes:
+            \\  api:
+            \\    command: "true"
+            \\  web:
+            \\    command: "true"
+        , "/nonexistent", .{ .io = threaded.io(), .environ = &environ }, null);
+        errdefer self.cfg.deinit();
+
+        self.sup = try Supervisor.init(gpa, &self.cfg, .{
+            .io = threaded.io(),
+            .environ = &environ,
+            .base_dir = self.dir,
+            .log_dir = self.dir,
+            .log_root = self.root,
+        }, null);
+        errdefer self.sup.deinit();
+
+        var line_buf: [64]u8 = undefined;
+        for (0..lines) |n| {
+            const line = try std.fmt.bufPrint(&line_buf, "line {d}\n", .{n});
+            self.sup.workers[0].archive.append(line);
+        }
+
+        self.tty = .{ .fd = -1, .original = undefined };
+        self.ui = try Ui.init(gpa, &self.sup, &self.tty);
+        // A fixed size, so the number of rows the log gets is a fact of the
+        // test rather than a fact of whatever ran it.
+        self.ui.size = .{ .rows = 24, .cols = 80 };
+        return self;
+    }
+
+    fn deinit(self: *Fixture) void {
+        const gpa = self.gpa;
+        self.ui.deinit(gpa);
+        self.sup.deinit();
+        self.cfg.deinit();
+        _ = store.clean(gpa, self.root, .all);
+        var buf: [4096]u8 = undefined;
+        if (std.fmt.bufPrintZ(&buf, "{s}/api.log", .{self.dir})) |p| os.unlink(p.ptr) else |_| {}
+        if (std.fmt.bufPrintZ(&buf, "{s}/web.log", .{self.dir})) |p| os.unlink(p.ptr) else |_| {}
+        if (std.fmt.bufPrintZ(&buf, "{s}", .{self.root})) |p| os.rmdir(p.ptr) else |_| {}
+        if (std.fmt.bufPrintZ(&buf, "{s}", .{self.dir})) |p| os.rmdir(p.ptr) else |_| {}
+        gpa.free(self.root);
+        gpa.free(self.dir);
+        gpa.destroy(self);
+    }
+
+    /// Puts `n` Sessions' worth of saved logs under the fixture's root, as
+    /// though this many runs had happened before this one.
+    fn saveRuns(self: *Fixture, n: usize) !void {
+        for (0..n) |k| {
+            const dir = try store.openSession(self.gpa, self.root, 1786703525 + @as(i64, @intCast(k)));
+            defer self.gpa.free(dir);
+            var buf: [4096]u8 = undefined;
+            const file = try std.fmt.bufPrintZ(&buf, "{s}/api.log", .{dir});
+            const fd = try os.open(file.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644);
+            defer os.close(fd);
+            try os.writeAll(fd, "saved output\n");
+        }
+    }
+
+    /// The text of the line the Cursor is on, which is what most of these
+    /// tests are really asking about.
+    fn cursorLine(self: *Fixture, buf: []u8) []const u8 {
+        const a = &self.sup.workers[self.ui.selected].archive;
+        return a.lineInto(self.ui.cursorAt(self.ui.selected), buf);
+    }
+};
+
+test "arrows move between processes in the list and between lines in the log" {
+    const gpa = testing.allocator;
+    const f = try Fixture.init(gpa, 40);
+    defer f.deinit();
+
+    // The list is where a reader lands, and up and down walk it.
+    try testing.expectEqual(Focus.list, f.ui.focus);
+    _ = f.ui.onKey(.down);
+    try testing.expectEqual(@as(usize, 1), f.ui.selected);
+    _ = f.ui.onKey(.up);
+    try testing.expectEqual(@as(usize, 0), f.ui.selected);
+
+    // Right goes in. Now the same two keys walk lines, and the service they
+    // were walking a moment ago stays where it was.
+    _ = f.ui.onKey(.right);
+    try testing.expectEqual(Focus.log, f.ui.focus);
+
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("line 39", f.cursorLine(&buf));
+    _ = f.ui.onKey(.up);
+    try testing.expectEqualStrings("line 38", f.cursorLine(&buf));
+    _ = f.ui.onKey(.up);
+    try testing.expectEqualStrings("line 37", f.cursorLine(&buf));
+    try testing.expectEqual(@as(usize, 0), f.ui.selected);
+
+    // Left comes back out, and up and down mean services again.
+    _ = f.ui.onKey(.left);
+    try testing.expectEqual(Focus.list, f.ui.focus);
+    _ = f.ui.onKey(.down);
+    try testing.expectEqual(@as(usize, 1), f.ui.selected);
+}
+
+test "v starts a selection at the Cursor, not at the top of the screen" {
+    const gpa = testing.allocator;
+    const f = try Fixture.init(gpa, 40);
+    defer f.deinit();
+
+    // Into the log, then three lines up from live.
+    _ = f.ui.onKey(.right);
+    for (0..3) |_| _ = f.ui.onKey(.up);
+
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("line 36", f.cursorLine(&buf));
+
+    _ = f.ui.onKey(.{ .char = 'v' });
+    try testing.expectEqual(Mode.visual, f.ui.mode);
+    try testing.expectEqual(@as(usize, 1), f.ui.picked_lines);
+
+    // The selection is anchored on the line the reader is pointing at. It used
+    // to be anchored at the top of the pane, so `v` on a screenful of output
+    // began the range several lines above wherever they were looking, and `y`
+    // then copied from there.
+    const a = &f.sup.workers[0].archive;
+    try testing.expectEqualStrings("line 36", a.lineInto(f.ui.anchor, &buf));
+    try testing.expect(f.ui.anchor != f.ui.viewTop(0));
+
+    // And it grows from there, one line per keypress, in either direction.
+    _ = f.ui.onKey(.up);
+    try testing.expectEqual(@as(usize, 2), f.ui.picked_lines);
+    _ = f.ui.onKey(.down);
+    _ = f.ui.onKey(.down);
+    try testing.expectEqual(@as(usize, 2), f.ui.picked_lines);
+}
+
+test "what a copy would take follows where the reader is" {
+    const gpa = testing.allocator;
+    const f = try Fixture.init(gpa, 40);
+    defer f.deinit();
+    const a = &f.sup.workers[0].archive;
+    var buf: [64]u8 = undefined;
+
+    // From the list, with nothing picked: the screenful on show, which is what
+    // "copy this log" means when nobody has pointed at anything.
+    const from_list = f.ui.excerptRange();
+    try testing.expectEqual(f.ui.viewTop(0), from_list.first);
+    try testing.expect(from_list.last > from_list.first);
+
+    // From inside the log: the one line the Cursor is on. A screenful here
+    // would be a copy of something other than what the mark points at.
+    _ = f.ui.onKey(.right);
+    for (0..5) |_| _ = f.ui.onKey(.up);
+    const from_log = f.ui.excerptRange();
+    try testing.expectEqual(from_log.first, from_log.last);
+    try testing.expectEqualStrings("line 34", a.lineInto(from_log.first, &buf));
+
+    // With a range picked: exactly that range, whichever end it grew from.
+    _ = f.ui.onKey(.{ .char = 'v' });
+    for (0..2) |_| _ = f.ui.onKey(.up);
+    const picked = f.ui.excerptRange();
+    try testing.expectEqualStrings("line 32", a.lineInto(picked.first, &buf));
+    try testing.expectEqualStrings("line 34", a.lineInto(picked.last, &buf));
+    try testing.expectEqual(@as(usize, 3), f.ui.picked_lines);
+}
+
+test "the Cursor is never off the pane, however the view moved" {
+    const gpa = testing.allocator;
+    const f = try Fixture.init(gpa, 400);
+    defer f.deinit();
+    const a = &f.sup.workers[0].archive;
+
+    _ = f.ui.onKey(.right);
+    const height = f.ui.logHeight();
+
+    // Every way the view can move without touching the Cursor directly.
+    for ([_]term.Key{ .page_up, .page_up, .page_down, .home, .end, .page_up }) |key| {
+        _ = f.ui.onKey(key);
+        const top = f.ui.viewTop(0);
+        const bottom = a.scrollForward(top, height - 1);
+        const cursor = f.ui.cursorAt(0);
+        try testing.expect(cursor >= top);
+        try testing.expect(cursor <= bottom);
+    }
+}
+
+test "reading down to the newest line puts the view back on live output" {
+    const gpa = testing.allocator;
+    const f = try Fixture.init(gpa, 40);
+    defer f.deinit();
+
+    _ = f.ui.onKey(.right);
+    for (0..6) |_| _ = f.ui.onKey(.up);
+    try testing.expect(!f.ui.follow[0]);
+
+    // Walking back down to the last line resumes following, so new output
+    // keeps arriving without a second keypress to ask for it.
+    for (0..6) |_| _ = f.ui.onKey(.down);
+    try testing.expect(f.ui.follow[0]);
+
+    var buf: [64]u8 = undefined;
+    f.sup.workers[0].archive.append("line 40\n");
+    try testing.expectEqualStrings("line 40", f.cursorLine(&buf));
+}
+
+test "the Cursor stays where it was left, per Worker" {
+    const gpa = testing.allocator;
+    const f = try Fixture.init(gpa, 40);
+    defer f.deinit();
+    var buf: [64]u8 = undefined;
+
+    _ = f.ui.onKey(.right);
+    for (0..4) |_| _ = f.ui.onKey(.up);
+    try testing.expectEqualStrings("line 35", f.cursorLine(&buf));
+
+    // Out to the list, over to the other service, and back. Losing the place
+    // here is what makes checking something else cost you your place.
+    _ = f.ui.onKey(.left);
+    _ = f.ui.onKey(.down);
+    try testing.expectEqual(@as(usize, 1), f.ui.selected);
+    _ = f.ui.onKey(.up);
+    _ = f.ui.onKey(.right);
+    try testing.expectEqualStrings("line 35", f.cursorLine(&buf));
+}
+
+test "Esc lets go of a selection before it lets go of the log" {
+    const gpa = testing.allocator;
+    const f = try Fixture.init(gpa, 40);
+    defer f.deinit();
+
+    _ = f.ui.onKey(.right);
+    _ = f.ui.onKey(.{ .char = 'v' });
+    try testing.expectEqual(Mode.visual, f.ui.mode);
+
+    // One press undoes one thing. Pressing it twice is how someone who is lost
+    // gets all the way back out.
+    _ = f.ui.onKey(.escape);
+    try testing.expectEqual(Mode.normal, f.ui.mode);
+    try testing.expectEqual(Focus.log, f.ui.focus);
+    _ = f.ui.onKey(.escape);
+    try testing.expectEqual(Focus.list, f.ui.focus);
+}
+
+test "a log key pressed from the list brings the reader into the log with it" {
+    const gpa = testing.allocator;
+    const f = try Fixture.init(gpa, 40);
+    defer f.deinit();
+
+    // j, PgUp and v only mean anything against a log, so they take Focus
+    // rather than moving a Cursor nobody can see.
+    for ([_]term.Key{ .{ .char = 'j' }, .page_up, .{ .char = 'v' } }) |key| {
+        f.ui.focus = .list;
+        f.ui.clearPick();
+        _ = f.ui.onKey(key);
+        try testing.expectEqual(Focus.log, f.ui.focus);
+    }
+}
+
+// ---------------------------------------------------------- leaving
+
+test "leaving asks about the logs on disk, and keeps them unless told not to" {
+    const gpa = testing.allocator;
+    const f = try Fixture.init(gpa, 5);
+    defer f.deinit();
+    try f.saveRuns(3);
+
+    // The Session has stopped; before the terminal comes back there is one
+    // question, and it says what it is about to delete.
+    try testing.expect(!f.ui.beginLeaving());
+    try testing.expectEqual(Prompt.clean_logs, f.ui.prompt);
+    try testing.expectEqual(@as(usize, 3), f.ui.prompt_usage.sessions);
+    try testing.expect(f.ui.prompt_usage.bytes > 0);
+
+    // Enter is the default, and the default keeps everything. Somebody who
+    // hits it without reading has lost nothing.
+    try testing.expect(f.ui.answerPrompt(.enter));
+    try testing.expect(f.ui.finished);
+    try testing.expectEqual(@as(usize, 0), f.ui.cleaned.sessions);
+    try testing.expectEqual(@as(usize, 3), store.usage(gpa, f.root).sessions);
+}
+
+test "the answer that deletes older runs keeps the one that just finished" {
+    const gpa = testing.allocator;
+    const f = try Fixture.init(gpa, 5);
+    defer f.deinit();
+    try f.saveRuns(4);
+
+    _ = f.ui.beginLeaving();
+    try testing.expect(f.ui.answerPrompt(.{ .char = 'o' }));
+    try testing.expectEqual(@as(usize, 3), f.ui.cleaned.sessions);
+
+    const left = try store.list(gpa, f.root);
+    defer gpa.free(left);
+    try testing.expectEqual(@as(usize, 1), left.len);
+    try testing.expectEqualStrings("2026-08-14T10-32-08Z", left[0].text());
+}
+
+test "the answer that deletes everything leaves nothing behind" {
+    const gpa = testing.allocator;
+    const f = try Fixture.init(gpa, 5);
+    defer f.deinit();
+    try f.saveRuns(3);
+
+    _ = f.ui.beginLeaving();
+    try testing.expect(f.ui.answerPrompt(.{ .char = 'y' }));
+    try testing.expectEqual(@as(usize, 3), f.ui.cleaned.sessions);
+    try testing.expectEqual(@as(usize, 0), store.usage(gpa, f.root).sessions);
+}
+
+test "q twice leaves without ever asking about logs" {
+    const gpa = testing.allocator;
+    const f = try Fixture.init(gpa, 5);
+    defer f.deinit();
+    try f.saveRuns(3);
+
+    // The first q begins shutdown and stays. The second says stop asking me
+    // things — and it must not be read as the answer to a question that was
+    // not on screen when it was pressed.
+    try testing.expect(!f.ui.onKey(.{ .char = 'q' }));
+    try testing.expect(f.sup.shutting_down);
+    try testing.expectEqual(Prompt.none, f.ui.prompt);
+
+    try testing.expect(f.ui.onKey(.{ .char = 'q' }));
+    try testing.expect(f.ui.finished);
+    try testing.expectEqual(Prompt.none, f.ui.prompt);
+    try testing.expectEqual(@as(usize, 0), f.ui.cleaned.sessions);
+    try testing.expectEqual(@as(usize, 3), store.usage(gpa, f.root).sessions);
+
+    // And having already said so, the way out does not stop to ask.
+    try testing.expect(f.ui.beginLeaving());
+}
+
+test "with no saved logs there is nothing to ask about" {
+    const gpa = testing.allocator;
+    const f = try Fixture.init(gpa, 5);
+    defer f.deinit();
+
+    try testing.expect(f.ui.beginLeaving());
+    try testing.expectEqual(Prompt.none, f.ui.prompt);
+}
 
 test "printClamped truncates on visible columns and resets afterwards" {
     var buf: [256]u8 = undefined;
@@ -1794,22 +2630,99 @@ test "a status too long for the footer loses its tail, not its meaning" {
 }
 
 test "the footer sheds actions from the least useful end" {
-    const all: [chips.len]bool = @splat(true);
-    const full = chipsWidth(all);
-    try testing.expect(full > 0);
+    for ([_]ChipSet{ list_chips, log_chips }) |set| {
+        const all: [max_chips]bool = @splat(true);
+        const full = chipsWidth(set, all);
+        try testing.expect(full > 0);
 
-    // Whatever drops, Copy, Keys and Quit survive: the first is what the view
-    // is for and the other two are how a reader gets un-stuck.
-    var shown = all;
-    for (chip_drop_order) |i| {
-        shown[i] = false;
-        try testing.expect(chipsWidth(shown) < full);
-        try testing.expect(chips[i].action != .copy);
-        try testing.expect(chips[i].action != .help);
-        try testing.expect(chips[i].action != .quit);
+        var shown = all;
+        for (set.drop) |i| {
+            shown[i] = false;
+            try testing.expect(chipsWidth(set, shown) < full);
+            // Whatever drops, the way out and the way to the whole key list
+            // survive: those are how a reader who is stuck gets un-stuck.
+            try testing.expect(set.items[i].action != .help);
+            try testing.expect(set.items[i].action != .quit);
+        }
+        // With everything droppable gone there is still a control surface.
+        try testing.expect(chipsWidth(set, shown) > 0);
     }
-    // With everything droppable gone there is still a control surface left.
-    try testing.expect(chipsWidth(shown) > 0);
+}
+
+test "every chip a click can land on names an action, and labels name none" {
+    // The invariant behind `chip_col` being left at zero for a label: a region
+    // is registered exactly when there is something for a click to do.
+    for ([_]ChipSet{ list_chips, log_chips }) |set| {
+        try testing.expect(set.items.len <= max_chips);
+        var actionable: usize = 0;
+        for (set.items) |c| {
+            if (c.action != .label) actionable += 1;
+        }
+        try testing.expect(actionable > 0);
+    }
+}
+
+test "both control surfaces say how to move and how to leave" {
+    // The point of feature "shortcuts should be visible without pressing ?":
+    // whichever pane has Focus, the footer answers "how do I move" and "how do
+    // I get out" without anybody opening the help.
+    for ([_]ChipSet{ list_chips, log_chips }) |set| {
+        var has_arrows = false;
+        var has_quit = false;
+        for (set.items) |c| {
+            if (std.mem.eql(u8, c.key, "↑↓")) has_arrows = true;
+            if (c.action == .quit) has_quit = true;
+        }
+        try testing.expect(has_arrows);
+        try testing.expect(has_quit);
+    }
+}
+
+test "the arrow-key hint survives an eighty-column terminal" {
+    // 80 is what a terminal opens at, so it is the width the control surface
+    // has to be right at. Both sets must still be advertising how to move when
+    // everything that fits has been fitted.
+    for ([_]ChipSet{ list_chips, log_chips }) |set| {
+        var shown: [max_chips]bool = @splat(true);
+        var dropped: usize = 0;
+        while (Ui.hint_floor + 2 + chipsWidth(set, shown) > 80 and dropped < set.drop.len) {
+            shown[set.drop[dropped]] = false;
+            dropped += 1;
+        }
+        try testing.expect(Ui.hint_floor + 2 + chipsWidth(set, shown) <= 80);
+
+        var arrows_shown = false;
+        for (set.items, 0..) |c, i| {
+            if (shown[i] and std.mem.eql(u8, c.key, "↑↓")) arrows_shown = true;
+        }
+        try testing.expect(arrows_shown);
+    }
+}
+
+test "every key in the help list fits the screen the help is given" {
+    // 24 rows is what a terminal opens at. A key list that runs off the bottom
+    // is a key list that lies about what the view can do — and the whole point
+    // of the row after this list is that it is the *only* thing allowed to be
+    // pushed off, because the log pane's title says it anyway.
+    try testing.expect(help_rows.len <= helpHeight(24));
+
+    // Nothing in the list is a bare key with nothing said about it, or a
+    // description with no key to press.
+    for (help_rows) |r| {
+        if (r.head) {
+            try testing.expect(r.text.len > 0);
+        } else if (r.key.len > 0) {
+            try testing.expect(r.text.len > 0);
+        }
+    }
+}
+
+test "a chip's width is columns, not bytes" {
+    // "↑↓" is six bytes and two columns. Measuring it in bytes pushed the
+    // chips four columns past the right edge, which on a narrow terminal ate
+    // the message beside them.
+    const arrows: Chip = .{ .key = "↑↓", .label = "Line", .action = .label };
+    try testing.expectEqual(@as(usize, 2 + 1 + 4), arrows.width());
 }
 
 test "a border reaches the right edge whatever the terminal is wide" {

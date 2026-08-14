@@ -19,7 +19,7 @@ owner. So `tail -f`, `grep`, `less`, `scp`, and your editor all work on day one,
 and "copy this log" stops being a feature that has to be invented.
 
 ```
-                  ┌─ .devrun/logs/<name>.log ──→ tail · grep · less · $EDITOR
+                  ┌─ .devrun/logs/latest/<name>.log ──→ tail · grep · less · $EDITOR
 process ──stdout──┤
                   └─ in-memory window (1 MB)  ──→ TUI, scrolls past it via pread
 
@@ -64,9 +64,12 @@ graph with all five `depends_on` conditions, readiness probes over `exec` and
 `http_get`, the four restart policies, and a shutdown ladder that honours the
 signal and grace period the file asks for.
 
-**Keeps the logs.** `.devrun/logs/<name>.log` is a plain file, byte-faithful,
-ANSI intact, being appended to while the Session runs. Scrollback goes to the
-start of the run rather than to the end of a buffer.
+**Keeps the logs.** `.devrun/logs/latest/<name>.log` is a plain file,
+byte-faithful, ANSI intact, being appended to while the Session runs. Scrollback
+goes to the start of the run rather than to the end of a buffer. Every run gets
+its own directory, so restarting to reproduce something does not delete the log
+of the thing you were reproducing — `devrun up` keeps the newest ten runs and
+`devrun clean` clears them out.
 
 **Gets lines out.** Drag across the log to pick lines, `y` to copy. Copy goes
 over OSC 52, so it lands on the clipboard of the machine you are sitting at,
@@ -88,6 +91,8 @@ $ devrun logs api              # prints the Archive's path — the log is a file
 $ devrun status                # ask a running Session what it is doing
 $ devrun samples               # per-process CPU, memory, disk I/O
 $ devrun restart api           # act on one Worker without stopping the rest
+$ devrun clean                 # delete saved logs from previous runs
+$ devrun up --keep 30          # keep more of them (0 keeps every run)
 ```
 
 Piped or redirected, `up` prints prefixed lines instead of drawing, so
@@ -149,25 +154,40 @@ log, take lines out of it, and see which process is working.
 │ ● parser  running    2m 13s    1.6 GB     4 █  99.8%        -         -     │
 │ ✗ worker  failed         12s        -     -        -        3    killed     │
 │  memory  1.3 GB across 6 processes   firecracker 874 MB   go 58 MB …        │
-├─ go  .devrun/logs/go.log ───────────────────────────────────────────────────┤
+├─ ▸ go  .devrun/logs/latest/go.log ──────────────────────────────────────────┤
 │  {"time":"09:31:33","level":"info","msg":"migrations up to date"}           │
 │▌ {"time":"09:31:33","level":"warn","msg":"embedding provider not set"}      │
-│▌ {"time":"09:31:33","level":"info","msg":"storage connected"}               │
+│▸ {"time":"09:31:33","level":"info","msg":"storage connected"}               │
 └─────────────────────────────────────────────────────────────────────────────┘
-   ↑ picked lines
+ ↑↓ line · v select · y copy              ↑↓ Line  v Select  y Copy  ← Back  …
 ```
+
+`▌` is a picked line and `▸` is the one the cursor is on. The `▸` in the box
+title says the arrow keys are talking to the log rather than to the list above.
+
+Two places to be — the service list and a log — and the arrow keys mean
+whichever one you are in. `→` goes into the log, `←` comes back out, and the
+footer says which keys are live where you are standing, so `?` is for the whole
+list rather than for finding the key you needed.
 
 | | |
 |---|---|
-| drag, or `v` then `↑` / `↓` | pick lines |
-| `y` | copy — the picked lines, or the visible pane |
-| Esc | let the picked lines go |
-| click, Tab, `n` / `p`, `←` / `→` | switch process |
-| wheel, `j` / `k`, `↑` / `↓`, PgUp / PgDn | scroll |
+| `↑` / `↓` | another service, in the list — another line, in a log |
+| `→` / `←` | go into the log, come back to the list |
+| click, Tab, `n` / `p` | switch process from anywhere |
+| `y` | copy — the line you are on, or the lines you picked |
+| `v` then `↑` / `↓`, or drag | pick a range of lines |
+| Esc | let the picked lines go; again to leave the log |
+| wheel, `j` / `k`, PgUp / PgDn | move through the log |
 | Home / End, `g` / `G` | jump to the start, or back to live |
 | `s` / `r` / `S` | stop, restart, start this process |
 | `?` | every key, spelled out |
 | `q` | shut the Session down; again to leave immediately |
+
+`y` takes the line the cursor is on, and `v` starts a selection *there* — not at
+the top of the screen, which is what it used to do and what made copying a
+stack trace a matter of scrolling until the line you wanted happened to be the
+first one.
 
 The log gets the full width because that is what it is for — a JSON line or a
 stack trace is long. The box title over it is the path it is being written to,
