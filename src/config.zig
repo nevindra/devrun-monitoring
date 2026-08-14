@@ -89,6 +89,16 @@ pub const Dependency = struct {
     condition: Condition,
 };
 
+/// How a Worker is asked to stop, before the ladder escalates to SIGKILL.
+pub const Shutdown = struct {
+    /// Signal number, matching process-compose's `shutdown.signal`. Kept as a
+    /// number rather than an enum because that is what the file holds, and a
+    /// user writing `signal: 2` means 2 on this machine.
+    signal: u8 = 15, // SIGTERM
+    /// How long the Group has to exit on its own before it is killed.
+    timeout_seconds: u32 = 10,
+};
+
 pub const Worker = struct {
     name: []const u8,
     description: ?[]const u8 = null,
@@ -99,6 +109,11 @@ pub const Worker = struct {
     depends_on: []const Dependency = &.{},
     restart: Restart = .no,
     readiness_probe: ?Probe = null,
+    /// Substring that, once seen in this Worker's Archive, satisfies a
+    /// `process_log_ready` dependency. Without it that condition can never be
+    /// met, so `checkDependencies` refuses the pair.
+    ready_log_line: ?[]const u8 = null,
+    shutdown: Shutdown = .{},
 };
 
 pub const Shell = struct {
@@ -460,6 +475,10 @@ fn mapWorker(ctx: Ctx, name: []const u8, v: Yaml.Value) !Worker {
             w.restart = try mapAvailability(ctx, value, kp);
         } else if (std.mem.eql(u8, key, "readiness_probe")) {
             w.readiness_probe = try mapProbe(ctx, value, kp);
+        } else if (std.mem.eql(u8, key, "ready_log_line")) {
+            w.ready_log_line = try expectScalar(ctx, value, kp);
+        } else if (std.mem.eql(u8, key, "shutdown")) {
+            w.shutdown = try mapShutdown(ctx, value, kp);
         } else {
             return ctx.unsupported(path, key);
         }
@@ -501,6 +520,26 @@ fn mapAvailability(ctx: Ctx, v: Yaml.Value, path: []const u8) !Restart {
             );
     }
     return restart;
+}
+
+fn mapShutdown(ctx: Ctx, v: Yaml.Value, path: []const u8) !Shutdown {
+    const m = try expectMap(ctx, v, path);
+    var out = Shutdown{};
+    for (m.keys(), m.values()) |key, value| {
+        const kp = try std.fmt.allocPrint(ctx.arena, "{s}.{s}", .{ path, key });
+        if (std.mem.eql(u8, key, "signal")) {
+            const n = try expectU32(ctx, value, kp);
+            if (n == 0 or n > 31) {
+                return ctx.fail("{s}: signal {d} is not a signal number", .{ kp, n });
+            }
+            out.signal = @intCast(n);
+        } else if (std.mem.eql(u8, key, "timeout_seconds")) {
+            out.timeout_seconds = try expectU32(ctx, value, kp);
+        } else {
+            return ctx.unsupported(path, key);
+        }
+    }
+    return out;
 }
 
 fn mapProbe(ctx: Ctx, v: Yaml.Value, path: []const u8) !Probe {
@@ -570,29 +609,110 @@ fn mapHttpGet(ctx: Ctx, v: Yaml.Value, path: []const u8) !HttpGet {
     return get;
 }
 
-/// Every dependency must name a Worker that exists. Caught here rather than at
-/// startup so a typo fails before anything is spawned.
+/// Everything about the dependency graph that can be decided from the text
+/// alone. All of it is caught here rather than at startup, so a broken graph
+/// fails before anything is spawned rather than halfway through bringing a
+/// Session up.
 fn checkDependencies(ctx: Ctx, workers: []const Worker) !void {
     for (workers) |w| {
         for (w.depends_on) |dep| {
-            var found = false;
-            for (workers) |other| {
-                if (std.mem.eql(u8, other.name, dep.name)) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                return ctx.fail(
-                    "processes.{s}.depends_on: \"{s}\" is not a process in this config",
-                    .{ w.name, dep.name },
-                );
-            }
+            const target = indexOf(workers, dep.name) orelse return ctx.fail(
+                "processes.{s}.depends_on: \"{s}\" is not a process in this config",
+                .{ w.name, dep.name },
+            );
             if (std.mem.eql(u8, dep.name, w.name)) {
                 return ctx.fail("processes.{s} depends on itself", .{w.name});
             }
+            // A condition the target can never reach would stall the Session
+            // with no error, which is the failure mode this project exists to
+            // avoid. Both of these are cheap to check and impossible to debug
+            // from the outside.
+            switch (dep.condition) {
+                .process_healthy => if (workers[target].readiness_probe == null) {
+                    return ctx.fail(
+                        "processes.{s}.depends_on.{s}: waits for process_healthy, but " ++
+                            "\"{s}\" has no readiness_probe, so it can never become healthy",
+                        .{ w.name, dep.name, dep.name },
+                    );
+                },
+                .process_log_ready => if (workers[target].ready_log_line == null) {
+                    return ctx.fail(
+                        "processes.{s}.depends_on.{s}: waits for process_log_ready, but " ++
+                            "\"{s}\" has no ready_log_line, so it can never be log-ready",
+                        .{ w.name, dep.name, dep.name },
+                    );
+                },
+                else => {},
+            }
         }
     }
+    try checkAcyclic(ctx, workers);
+}
+
+fn indexOf(workers: []const Worker, name: []const u8) ?usize {
+    for (workers, 0..) |w, i| {
+        if (std.mem.eql(u8, w.name, name)) return i;
+    }
+    return null;
+}
+
+/// Kahn's algorithm: repeatedly retire a Worker with nothing left to wait on.
+/// Whatever cannot be retired is in a cycle or behind one, and a cycle means
+/// the Session would sit forever with every Worker waiting on another.
+///
+/// Iterative rather than a recursive depth-first search, so a pathological
+/// config cannot overflow the stack — the config is only bounded at 4 MB, and
+/// that is a lot of one-line Workers.
+fn checkAcyclic(ctx: Ctx, workers: []const Worker) !void {
+    const n = workers.len;
+    const remaining = try ctx.arena.alloc(u32, n);
+    for (workers, remaining) |w, *r| r.* = @intCast(w.depends_on.len);
+
+    // A ready queue over the same allocation the visit order uses: each Worker
+    // enters exactly once, so `n` slots is the exact bound.
+    const queue = try ctx.arena.alloc(usize, n);
+    var head: usize = 0;
+    var tail: usize = 0;
+    for (remaining, 0..) |r, i| {
+        if (r == 0) {
+            queue[tail] = i;
+            tail += 1;
+        }
+    }
+
+    var retired: usize = 0;
+    while (head < tail) {
+        const done = queue[head];
+        head += 1;
+        retired += 1;
+        // Anything waiting on `done` now has one fewer reason to wait.
+        for (workers, 0..) |w, i| {
+            for (w.depends_on) |dep| {
+                if (!std.mem.eql(u8, dep.name, workers[done].name)) continue;
+                remaining[i] -= 1;
+                if (remaining[i] == 0) {
+                    queue[tail] = i;
+                    tail += 1;
+                }
+            }
+        }
+    }
+
+    if (retired == n) return;
+
+    var names: std.Io.Writer.Allocating = .init(ctx.arena);
+    var first = true;
+    for (remaining, workers) |r, w| {
+        if (r == 0) continue;
+        if (!first) names.writer.writeAll(", ") catch {};
+        names.writer.writeAll(w.name) catch {};
+        first = false;
+    }
+    return ctx.fail(
+        "depends_on has a cycle: {s} can never start, because each is waiting " ++
+            "on another of them.",
+        .{names.written()},
+    );
 }
 
 // ------------------------------------------------------------- tests
@@ -791,6 +911,127 @@ test "rejects a dependency on a process that does not exist" {
     defer diag.deinit(testing.allocator);
     try testing.expectError(error.Invalid, loadForTest(src, &.{}, &diag));
     try testing.expect(std.mem.indexOf(u8, diag.message.?, "\"db\" is not a process") != null);
+}
+
+test "rejects a dependency cycle instead of stalling on it at runtime" {
+    const src =
+        \\processes:
+        \\  a:
+        \\    command: "run a"
+        \\    depends_on:
+        \\      c:
+        \\        condition: process_started
+        \\  b:
+        \\    command: "run b"
+        \\    depends_on:
+        \\      a:
+        \\        condition: process_started
+        \\  c:
+        \\    command: "run c"
+        \\    depends_on:
+        \\      b:
+        \\        condition: process_started
+        \\  free:
+        \\    command: "run free"
+        \\
+    ;
+    var diag: Diagnostic = .{};
+    defer diag.deinit(testing.allocator);
+    try testing.expectError(error.Invalid, loadForTest(src, &.{}, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message.?, "cycle") != null);
+    // Only the Workers actually stuck are named; the independent one is not.
+    try testing.expect(std.mem.indexOf(u8, diag.message.?, "free") == null);
+}
+
+test "a chain that is merely deep is not a cycle" {
+    const src =
+        \\processes:
+        \\  a:
+        \\    command: "run a"
+        \\  b:
+        \\    command: "run b"
+        \\    depends_on:
+        \\      a:
+        \\        condition: process_started
+        \\  c:
+        \\    command: "run c"
+        \\    depends_on:
+        \\      b:
+        \\        condition: process_started
+        \\
+    ;
+    var cfg = try loadForTest(src, &.{}, null);
+    defer cfg.deinit();
+    try testing.expectEqual(@as(usize, 3), cfg.workers.len);
+}
+
+test "rejects a condition the target can never reach" {
+    // process_healthy without a probe would wait forever with nothing on
+    // screen to say why — exactly the silent divergence this project refuses.
+    const healthy =
+        \\processes:
+        \\  db:
+        \\    command: "postgres"
+        \\  go:
+        \\    command: "go run ."
+        \\    depends_on:
+        \\      db:
+        \\        condition: process_healthy
+        \\
+    ;
+    var diag: Diagnostic = .{};
+    defer diag.deinit(testing.allocator);
+    try testing.expectError(error.Invalid, loadForTest(healthy, &.{}, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message.?, "no readiness_probe") != null);
+
+    const log_ready =
+        \\processes:
+        \\  db:
+        \\    command: "postgres"
+        \\  go:
+        \\    command: "go run ."
+        \\    depends_on:
+        \\      db:
+        \\        condition: process_log_ready
+        \\
+    ;
+    var diag2: Diagnostic = .{};
+    defer diag2.deinit(testing.allocator);
+    try testing.expectError(error.Invalid, loadForTest(log_ready, &.{}, &diag2));
+    try testing.expect(std.mem.indexOf(u8, diag2.message.?, "no ready_log_line") != null);
+}
+
+test "ready_log_line and shutdown round-trip, with process-compose's defaults" {
+    const src =
+        \\processes:
+        \\  db:
+        \\    command: "postgres"
+        \\    ready_log_line: "database system is ready to accept connections"
+        \\    shutdown:
+        \\      signal: 2
+        \\      timeout_seconds: 30
+        \\  go:
+        \\    command: "go run ."
+        \\    depends_on:
+        \\      db:
+        \\        condition: process_log_ready
+        \\
+    ;
+    var cfg = try loadForTest(src, &.{}, null);
+    defer cfg.deinit();
+
+    const db = cfg.workers[cfg.find("db").?];
+    try testing.expectEqualStrings(
+        "database system is ready to accept connections",
+        db.ready_log_line.?,
+    );
+    try testing.expectEqual(@as(u8, 2), db.shutdown.signal);
+    try testing.expectEqual(@as(u32, 30), db.shutdown.timeout_seconds);
+
+    // Unset shutdown means SIGTERM with a 10s grace, not signal 0 and no wait.
+    const go = cfg.workers[cfg.find("go").?];
+    try testing.expectEqual(@as(u8, 15), go.shutdown.signal);
+    try testing.expectEqual(@as(u32, 10), go.shutdown.timeout_seconds);
 }
 
 test "a probe needs exactly one of exec or http_get" {
