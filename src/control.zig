@@ -171,6 +171,14 @@ pub fn handle(line: []const u8, sup: *Supervisor, w: *std.Io.Writer) void {
 
     if (std.mem.eql(u8, verb, "status")) return status(sup, w);
     if (std.mem.eql(u8, verb, "samples")) return samples(sup, w);
+    if (std.mem.eql(u8, verb, "down")) {
+        // The Session shuts every Worker down through the same ladder `q` and
+        // SIGINT use, so a caller that asked politely gets the grace period
+        // the config asked for rather than a kill.
+        sup.beginShutdown();
+        w.writeAll("ok down\n") catch {};
+        return;
+    }
 
     const name = arg orelse {
         w.print("error: {s} needs a process name\n", .{verb}) catch {};
@@ -194,17 +202,61 @@ pub fn handle(line: []const u8, sup: *Supervisor, w: *std.Io.Writer) void {
     w.print("ok {s} {s}\n", .{ verb, name }) catch {};
 }
 
-/// Columns rather than JSON: the reader is usually a human running
-/// `devrun status`, and `awk` handles the rest.
+/// One tab-separated row per Worker:
+///
+///     name  state  pgid  restarts  archive_bytes  exit  uptime_ms  readiness
+///
+/// `exit` is `-`, `exit:N`, or `sig:NAME`. `uptime_ms` is how long the Group
+/// has been alive, or `-` when nothing is running.
+///
+/// `readiness` says what `running` means for this Worker, which a caller
+/// cannot work out from the state alone:
+///
+///   - `none`    nothing further to wait for; running is as ready as it gets
+///   - `probe`   a readiness probe decides, so the state will say `ready`
+///   - `pending` waiting on a `ready_log_line` that has not appeared
+///   - `met`     that line has appeared
+///
+/// This is here so that `devrun wait` does not have to read the config to
+/// interpret a reply. It could, when there is a config — but `devrun run`
+/// creates a Session with no file behind it, and a `wait` that only worked for
+/// half the Sessions would be worse than no `wait` at all.
+///
+/// Columns rather than JSON because this is the wire format, not the view:
+/// `devrun status` renders it for a person and `devrun status --json` renders
+/// it for a program, and both would rather parse fields than a nested object.
+/// Adding a column is safe here; every reader indexes from the left.
 fn status(sup: *Supervisor, w: *std.Io.Writer) void {
+    const now = os.nowMs();
     for (sup.workers) |*x| {
-        w.print("{s}\t{t}\t{d}\t{d}\t{d}\n", .{
+        w.print("{s}\t{t}\t{d}\t{d}\t{d}\t", .{
             x.name(),
             x.state,
             x.pgid,
             x.restarts,
             x.archive.len(),
         }) catch return;
+
+        if (x.exit) |e| switch (e) {
+            .exited => |c| w.print("exit:{d}", .{c}) catch return,
+            .signaled => |s| w.print("sig:{t}", .{s}) catch return,
+        } else w.writeAll("-") catch return;
+
+        if (x.state.alive() and x.started_ms > 0) {
+            w.print("\t{d}", .{now -| x.started_ms}) catch return;
+        } else {
+            w.writeAll("\t-") catch return;
+        }
+
+        // A probe answers through the state, so it is reported as `probe`
+        // rather than folded into `met` — a Worker with both a probe and a
+        // marker must not count as ready on the marker alone.
+        const readiness: []const u8 = if (x.spec.readiness_probe != null)
+            "probe"
+        else if (x.spec.ready_log_line == null)
+            "none"
+        else if (x.log_ready) "met" else "pending";
+        w.print("\t{s}\n", .{readiness}) catch return;
     }
 }
 

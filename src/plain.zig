@@ -36,6 +36,13 @@ pub const Printer = struct {
     last_state: []supervisor.State,
     colour: bool,
     name_width: usize,
+    /// Announce state changes but do not echo output. What a detached Session
+    /// uses: every line is already in an Archive, so writing them to a session
+    /// log as well would double the disk a Session costs to say nothing new.
+    quiet: bool = false,
+    /// Print the `devrun: api ready` state lines. Off for `devrun run`, where
+    /// the caller wanted their command's output and nothing wrapped around it.
+    announce: bool = true,
 
     pub fn init(gpa: Allocator, sup: *const Supervisor, colour: bool) !Printer {
         const n = sup.workers.len;
@@ -68,11 +75,17 @@ pub const Printer = struct {
         for (sup.workers, 0..) |*w, i| {
             if (self.last_state[i] != w.state) {
                 self.last_state[i] = w.state;
-                try self.status(w, out);
+                if (self.announce) try self.status(w, out);
             }
 
             var at = self.printed[i];
             const end = w.archive.len();
+            // The bookmark still moves, so switching this off and on again
+            // would resume from now rather than replay the whole Session.
+            if (self.quiet) {
+                self.printed[i] = end;
+                continue;
+            }
             var line_buf: [4096]u8 = undefined;
             while (at < end) {
                 // One scan per line: `lineAt` hands back the text and the
@@ -83,7 +96,9 @@ pub const Printer = struct {
                 if (line.end == at) break;
                 if (line.end == end and !endsWithNewline(&w.archive, end)) break;
 
-                try self.prefix(i, w.name(), out);
+                // No prefix in wrapper mode: there is one Worker, so a column
+                // naming it on every line says nothing and costs a column.
+                if (self.announce) try self.prefix(i, w.name(), out);
                 try out.writeAll(line.text);
                 try out.writeAll("\n");
                 at = line.end;

@@ -88,10 +88,187 @@ pub const Window = struct {
     }
 };
 
+/// The Index — a Worker's `.idx` sidecar, which is the only thing in devrun
+/// that knows *when* a byte was written.
+///
+/// An Archive is byte-faithful, which means it cannot carry a timestamp: the
+/// moment you interleave one, `tail -f` and `grep` stop seeing what the Worker
+/// actually said. So time is recorded beside the bytes instead of inside them,
+/// as fixed-width records of `(wall_ms, offset)` — one per chunk read off the
+/// Worker's pipe, not one per line.
+///
+/// Per chunk is what makes this nearly free. A Worker writing 80 KB/s in 64 KB
+/// reads costs 16 bytes a second of Index, against 80 KB of Archive. The price
+/// is resolution: every line in one chunk shares that chunk's stamp. For a dev
+/// server, a chunk is one burst of output, so the stamp is the burst's — which
+/// is the question anyone actually asks ("what did everything say when I hit
+/// that endpoint"), not "which of these two adjacent lines was first".
+///
+/// Fixed-width and sorted is the whole design: both lookups a reader needs
+/// (offset-for-a-time, time-for-an-offset) are a binary search of `pread`s, so
+/// answering "the last 2 minutes" over a 400 MB Archive reads a few hundred
+/// bytes and never scans.
+pub const Index = struct {
+    pub const magic = "DRIX";
+    pub const format_version: u32 = 1;
+    pub const header_len: u64 = 16;
+    pub const record_len: u64 = 16;
+
+    fd: os.Fd = -1,
+    /// The last stamp written, so a chunk landing in the same millisecond as
+    /// its predecessor adds nothing. Under a firehose this is most of them.
+    last_ms: u64 = 0,
+    wrote_any: bool = false,
+
+    pub const Record = struct { ms: u64, offset: u64 };
+
+    /// Truncating, for the same reason the Archive truncates: an Index
+    /// describes one Session's bytes, and last run's offsets describe nothing
+    /// in this one.
+    pub fn create(path: [*:0]const u8) !Index {
+        const fd = try os.open(path, .{
+            .ACCMODE = .RDWR,
+            .CREAT = true,
+            .TRUNC = true,
+            .CLOEXEC = true,
+        }, 0o644);
+        errdefer os.close(fd);
+
+        var head: [header_len]u8 = @splat(0);
+        @memcpy(head[0..4], magic);
+        std.mem.writeInt(u32, head[4..8], format_version, .little);
+        try os.writeAll(fd, &head);
+        return .{ .fd = fd };
+    }
+
+    pub fn deinit(self: *Index) void {
+        if (self.fd >= 0) os.close(self.fd);
+        self.fd = -1;
+    }
+
+    /// Records that the chunk at `offset` was read at `ms`. Failures are
+    /// swallowed: an Index is an accelerator for a query, and losing it is not
+    /// a reason to stop keeping the log it describes.
+    pub fn stamp(self: *Index, ms: u64, offset: u64) void {
+        if (self.fd < 0) return;
+        if (self.wrote_any and ms == self.last_ms) return;
+        var rec: [record_len]u8 = undefined;
+        std.mem.writeInt(u64, rec[0..8], ms, .little);
+        std.mem.writeInt(u64, rec[8..16], offset, .little);
+        os.writeAll(self.fd, &rec) catch return;
+        self.last_ms = ms;
+        self.wrote_any = true;
+    }
+};
+
+/// Read-only view of an Index written by a Session, possibly one that has
+/// already exited. Everything is a `pread`, so nothing is held in memory and a
+/// live Session appending to the file is not disturbed.
+pub const IndexReader = struct {
+    fd: os.Fd = -1,
+    count: u64 = 0,
+
+    /// A missing, foreign, or truncated Index is an empty one rather than an
+    /// error. The caller degrades to "no timestamps available" and still shows
+    /// the log, which beats refusing to print anything over a sidecar.
+    pub fn open(path: [*:0]const u8) IndexReader {
+        const fd = os.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0) catch return .{};
+        const size = os.fileSize(fd) orelse {
+            os.close(fd);
+            return .{};
+        };
+        if (size < Index.header_len) {
+            os.close(fd);
+            return .{};
+        }
+        var head: [Index.header_len]u8 = undefined;
+        const n = os.pread(fd, &head, 0) catch 0;
+        if (n < Index.header_len or
+            !std.mem.eql(u8, head[0..4], Index.magic) or
+            std.mem.readInt(u32, head[4..8], .little) != Index.format_version)
+        {
+            os.close(fd);
+            return .{};
+        }
+        return .{ .fd = fd, .count = (size - Index.header_len) / Index.record_len };
+    }
+
+    pub fn close(self: *IndexReader) void {
+        if (self.fd >= 0) os.close(self.fd);
+        self.fd = -1;
+        self.count = 0;
+    }
+
+    pub fn at(self: IndexReader, i: u64) ?Index.Record {
+        if (i >= self.count) return null;
+        var rec: [Index.record_len]u8 = undefined;
+        const n = os.pread(self.fd, &rec, Index.header_len + i * Index.record_len) catch return null;
+        if (n < Index.record_len) return null;
+        return .{
+            .ms = std.mem.readInt(u64, rec[0..8], .little),
+            .offset = std.mem.readInt(u64, rec[8..16], .little),
+        };
+    }
+
+    /// Byte offset to start reading from to see everything written at or after
+    /// `ms`. Null means nothing was written that recently.
+    ///
+    /// Rounds *outwards*: the record found is the last one at or before `ms`,
+    /// so the first chunk returned may contain a few lines older than asked
+    /// for. Showing a little too much is recoverable; silently clipping the
+    /// line that explains the failure is not.
+    ///
+    /// The exception is the final chunk, and it matters more than it looks. A
+    /// Worker that said one thing at startup and has been quiet since has an
+    /// Index of one record, and rounding outwards there would replay its whole
+    /// startup for every `--since 30s` forever after. The last record has no
+    /// successor to straddle the cutoff *with*, so if it is older than the
+    /// cutoff, everything is.
+    pub fn offsetAtOrAfter(self: IndexReader, ms: u64) ?u64 {
+        if (self.count == 0) return null;
+        const first = self.at(0) orelse return null;
+        if (ms <= first.ms) return first.offset;
+
+        // Last record with `rec.ms <= ms`. Its chunk is the one straddling the
+        // cutoff, so it is where reading begins.
+        var lo: u64 = 0;
+        var hi: u64 = self.count; // invariant: every record < lo has ms <= ms
+        while (lo + 1 < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const rec = self.at(mid) orelse break;
+            if (rec.ms <= ms) lo = mid else hi = mid;
+        }
+        const rec = self.at(lo) orelse return null;
+        if (lo == self.count - 1 and rec.ms < ms) return null;
+        return rec.offset;
+    }
+
+    /// When the bytes at `offset` were written. Null when the Index has
+    /// nothing covering it, which is every offset if there is no Index at all.
+    pub fn msAt(self: IndexReader, offset: u64) ?u64 {
+        if (self.count == 0) return null;
+        const first = self.at(0) orelse return null;
+        if (offset <= first.offset) return first.ms;
+
+        var lo: u64 = 0;
+        var hi: u64 = self.count;
+        while (lo + 1 < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const rec = self.at(mid) orelse break;
+            if (rec.offset <= offset) lo = mid else hi = mid;
+        }
+        const rec = self.at(lo) orelse return null;
+        return rec.ms;
+    }
+};
+
 /// A Worker's log file plus its Window. Owns the descriptor for the Session.
 pub const Archive = struct {
     fd: os.Fd,
     window: Window,
+    /// Time beside the bytes rather than in them. Absent when the caller did
+    /// not ask for one, which is every test that only cares about bytes.
+    index: Index = .{},
     /// Set when a write to disk failed. The Window keeps working, so the TUI
     /// still shows output — losing the record is worth reporting, not worth
     /// taking the Session down for.
@@ -99,7 +276,16 @@ pub const Archive = struct {
 
     /// Opens `path`, truncating it: an Archive covers one Session, so the
     /// previous run's bytes are not silently prepended to this one's.
-    pub fn create(gpa: Allocator, path: [*:0]const u8, window_bytes: usize) !Archive {
+    ///
+    /// `index_path` gets the `.idx` sidecar. Null skips it, and a sidecar that
+    /// cannot be created is skipped too rather than failing the Archive — the
+    /// log is the record, the Index only makes it faster to query.
+    pub fn create(
+        gpa: Allocator,
+        path: [*:0]const u8,
+        index_path: ?[*:0]const u8,
+        window_bytes: usize,
+    ) !Archive {
         // Read-write, not write-only: `readAt` preads this same descriptor to
         // serve scrollback older than the Window, and a write-only fd would
         // make that fall back to returning nothing at all.
@@ -110,11 +296,14 @@ pub const Archive = struct {
             .CLOEXEC = true,
         }, 0o644);
         errdefer os.close(fd);
-        return .{ .fd = fd, .window = try Window.init(gpa, window_bytes) };
+
+        const index: Index = if (index_path) |p| Index.create(p) catch .{} else .{};
+        return .{ .fd = fd, .window = try Window.init(gpa, window_bytes), .index = index };
     }
 
     pub fn deinit(self: *Archive, gpa: Allocator) void {
         if (self.fd >= 0) os.close(self.fd);
+        self.index.deinit();
         self.window.deinit(gpa);
         self.fd = -1;
     }
@@ -125,6 +314,10 @@ pub const Archive = struct {
     }
 
     pub fn append(self: *Archive, data: []const u8) void {
+        // Stamped before the bytes land, so the recorded offset is where this
+        // chunk *starts*. An Index whose offsets point past their own chunk
+        // would make every `--since` query miss its first line.
+        self.index.stamp(os.realtimeMs(), self.window.end);
         os.writeAll(self.fd, data) catch {
             self.write_failed = true;
         };
@@ -299,7 +492,7 @@ fn testArchive(window_bytes: usize) !struct { Archive, [:0]const u8 } {
     var name_buf: [64]u8 = undefined;
     const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/devrun-test-{d}.log", .{os.nowMs()});
     const path = try testing.allocator.dupeZ(u8, name);
-    const a = try Archive.create(testing.allocator, path.ptr, window_bytes);
+    const a = try Archive.create(testing.allocator, path.ptr, null, window_bytes);
     return .{ a, path };
 }
 
@@ -379,6 +572,108 @@ test "bytes are kept byte-faithful, ANSI and all" {
     a.append("carriage\r\n");
     var buf2: [64]u8 = undefined;
     try testing.expectEqualStrings("carriage", a.lineInto(a.lastLineStart(), &buf2));
+}
+
+test "an Index answers both directions, and rounds outwards on time" {
+    var name_buf: [64]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/devrun-idx-{d}.idx", .{os.nowMs()});
+    const path = try testing.allocator.dupeZ(u8, name);
+    defer {
+        os.unlink(path.ptr);
+        testing.allocator.free(path);
+    }
+
+    var idx = try Index.create(path.ptr);
+    // Chunks at t=1000/1100/1200, each 50 bytes long.
+    idx.stamp(1000, 0);
+    idx.stamp(1100, 50);
+    // Same millisecond as the last: skipped, because sub-millisecond ordering
+    // is not a question this format is claiming to answer.
+    idx.stamp(1100, 75);
+    idx.stamp(1200, 100);
+    idx.deinit();
+
+    var r = IndexReader.open(path.ptr);
+    defer r.close();
+    try testing.expectEqual(@as(u64, 3), r.count);
+
+    // Exactly on a boundary starts at that chunk.
+    try testing.expectEqual(@as(?u64, 50), r.offsetAtOrAfter(1100));
+    // Between two chunks rounds back to the one straddling the cutoff, so the
+    // first lines returned may slightly predate the request. Deliberate.
+    try testing.expectEqual(@as(?u64, 50), r.offsetAtOrAfter(1150));
+    // Older than everything: the whole Archive qualifies.
+    try testing.expectEqual(@as(?u64, 0), r.offsetAtOrAfter(1));
+    // Exactly the last stamp still includes that chunk.
+    try testing.expectEqual(@as(?u64, 100), r.offsetAtOrAfter(1200));
+    // Past the last stamp is nothing. Rounding outwards here would hand back
+    // the final chunk forever, so a Worker that went quiet an hour ago would
+    // keep answering `--since 30s` with its last words.
+    try testing.expect(r.offsetAtOrAfter(1201) == null);
+    try testing.expect(r.offsetAtOrAfter(99_999) == null);
+
+    // And the reverse lookup, which is what puts a clock on a printed line.
+    try testing.expectEqual(@as(?u64, 1000), r.msAt(0));
+    try testing.expectEqual(@as(?u64, 1000), r.msAt(49));
+    try testing.expectEqual(@as(?u64, 1100), r.msAt(50));
+    try testing.expectEqual(@as(?u64, 1100), r.msAt(99));
+    try testing.expectEqual(@as(?u64, 1200), r.msAt(100));
+    try testing.expectEqual(@as(?u64, 1200), r.msAt(1_000_000));
+}
+
+test "a missing or foreign Index reads as empty rather than failing" {
+    var r = IndexReader.open("/tmp/devrun-idx-does-not-exist-at-all.idx");
+    defer r.close();
+    try testing.expectEqual(@as(u64, 0), r.count);
+    try testing.expect(r.offsetAtOrAfter(0) == null);
+    try testing.expect(r.msAt(0) == null);
+
+    // A file that exists but is not ours: refused by magic, not misread. A
+    // wrong offset here would silently print the wrong slice of a log.
+    var name_buf: [64]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/devrun-notidx-{d}", .{os.nowMs()});
+    const path = try testing.allocator.dupeZ(u8, name);
+    defer {
+        os.unlink(path.ptr);
+        testing.allocator.free(path);
+    }
+    const fd = try os.open(path.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true }, 0o644);
+    try os.writeAll(fd, "not an index, just some bytes that are long enough");
+    os.close(fd);
+
+    var foreign = IndexReader.open(path.ptr);
+    defer foreign.close();
+    try testing.expectEqual(@as(u64, 0), foreign.count);
+}
+
+test "an Archive stamps every chunk it appends" {
+    var name_buf: [64]u8 = undefined;
+    const stem = try std.fmt.bufPrintZ(&name_buf, "/tmp/devrun-arc-{d}", .{os.nowMs()});
+    const log = try std.fmt.allocPrintSentinel(testing.allocator, "{s}.log", .{stem}, 0);
+    const idx = try std.fmt.allocPrintSentinel(testing.allocator, "{s}.idx", .{stem}, 0);
+    defer {
+        os.unlink(log.ptr);
+        os.unlink(idx.ptr);
+        testing.allocator.free(log);
+        testing.allocator.free(idx);
+    }
+
+    var a = try Archive.create(testing.allocator, log.ptr, idx.ptr, 4096);
+    a.append("first\n");
+    a.append("second\n");
+    const before = a.len();
+    a.deinit(testing.allocator);
+
+    var r = IndexReader.open(idx.ptr);
+    defer r.close();
+    // Two appends inside one millisecond collapse to one record, so what is
+    // asserted is coverage, not a count: every byte written has a stamp, and
+    // the newest stamp is not in the future of the newest byte.
+    try testing.expect(r.count >= 1);
+    const first = r.at(0).?;
+    try testing.expectEqual(@as(u64, 0), first.offset);
+    try testing.expect(r.msAt(before -| 1) != null);
+    try testing.expectEqual(@as(?u64, 0), r.offsetAtOrAfter(0));
 }
 
 test "window budget splits evenly and never starves a Worker" {

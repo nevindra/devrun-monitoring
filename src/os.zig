@@ -77,6 +77,20 @@ pub fn nowMs() u64 {
     return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
 }
 
+/// Milliseconds since the Unix epoch. Used for one thing only: stamping log
+/// chunks in an Index, where the reader is a *different process* started at a
+/// different time and needs an absolute answer to "when was this written".
+///
+/// Deliberately not `nowMs`. Monotonic time is the right clock for a deadline
+/// and the wrong one for a label — two processes agree on it only within one
+/// boot, and neither can turn it into something to print. A wall clock that
+/// steps mislabels a few lines; a monotonic stamp cannot be read at all.
+pub fn realtimeMs() u64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.REALTIME, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
+}
+
 // ------------------------------------------------------------- fds
 
 pub fn close(fd: Fd) void {
@@ -126,6 +140,21 @@ pub fn pread(fd: Fd, buf: []u8, offset: u64) !usize {
 
 pub fn unlink(path: [*:0]const u8) void {
     _ = linux.unlink(path);
+}
+
+/// Size of an open file. Null rather than an error: every caller is a reader
+/// deciding how much of an Index there is to search, and "none of it" is the
+/// same answer it would take from a failure.
+pub fn fileSize(fd: Fd) ?u64 {
+    // `statx` with `AT_EMPTY_PATH` rather than `lseek(SEEK_END)`: an Archive is
+    // being appended to by the Session that owns it, and a helper that moved
+    // the file offset as a side effect of asking a question would eventually
+    // be called on that descriptor and corrupt the log.
+    var st: linux.Statx = undefined;
+    const rc = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &st);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    if (!st.mask.SIZE) return null;
+    return st.size;
 }
 
 /// The working directory, or null when it will not fit or cannot be read.
@@ -440,6 +469,52 @@ pub const Signals = struct {
 pub fn becomeSubreaper() void {
     const PR_SET_CHILD_SUBREAPER = 36;
     _ = linux.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
+}
+
+// ------------------------------------------------------------- detaching
+
+pub const Fork = union(enum) {
+    /// In the original process; carries the child's pid.
+    parent: Pid,
+    /// In the new one.
+    child,
+};
+
+/// A plain fork, for `devrun up --detach`. Unlike `spawn` below there is no
+/// exec: the child *is* devrun, and goes on to be the Session.
+pub fn fork() !Fork {
+    const rc = linux.fork();
+    try check(rc);
+    const pid: Pid = @intCast(rc);
+    return if (pid == 0) .child else .{ .parent = pid };
+}
+
+/// Leaves the terminal behind: new session, no controlling tty. Without this a
+/// detached Session dies with the shell that started it, which is the one
+/// thing detaching was supposed to prevent.
+pub fn setsid() void {
+    _ = linux.setsid();
+}
+
+/// Points stdin, stdout and stderr at `fd`. Used by a detached Session so that
+/// a panic or a diagnostic has somewhere to land instead of a closed pipe.
+pub fn redirectStdio(fd: Fd) void {
+    _ = linux.dup2(fd, 0);
+    _ = linux.dup2(fd, 1);
+    _ = linux.dup2(fd, 2);
+}
+
+/// Sleeps. Only for the one-shot CLI paths (`wait`, and the parent half of
+/// `up --detach`), which have nothing to do but ask again in a moment. The
+/// Session's own loop never calls this — it blocks in `poll` with a deadline,
+/// which is how it stays responsive to a signal.
+pub fn sleepMs(ms: u64) void {
+    var ts: linux.timespec = .{
+        .sec = @intCast(ms / 1000),
+        .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
+    };
+    var rem: linux.timespec = undefined;
+    while (linux.errno(linux.nanosleep(&ts, &rem)) == .INTR) ts = rem;
 }
 
 // ------------------------------------------------------------- processes

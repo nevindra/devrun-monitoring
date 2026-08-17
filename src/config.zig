@@ -140,6 +140,84 @@ pub const Config = struct {
     }
 };
 
+/// A Config built in memory rather than read from a file — what `devrun run`
+/// hands the Supervisor.
+///
+/// There is no parsing here and no new concept: a `Worker` is a plain struct
+/// whose every field has a default, so an ad-hoc command is one of those with
+/// two fields filled in. That is the whole reason `devrun run` is cheap. The
+/// Supervisor cannot tell the difference and does not need to.
+pub const Adhoc = struct {
+    name: []const u8,
+    /// Already assembled into one string for the shell. See `shellJoin`.
+    command: []const u8,
+    working_dir: ?[]const u8 = null,
+    restart: Restart = .no,
+    ready_log_line: ?[]const u8 = null,
+};
+
+pub fn adhoc(gpa: Allocator, spec: Adhoc) !Config {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const workers = try arena.alloc(Worker, 1);
+    workers[0] = .{
+        .name = try arena.dupe(u8, spec.name),
+        .command = try arena.dupe(u8, spec.command),
+        .working_dir = if (spec.working_dir) |d| try arena.dupe(u8, d) else null,
+        .restart = spec.restart,
+        .ready_log_line = if (spec.ready_log_line) |l| try arena.dupe(u8, l) else null,
+    };
+    return .{ .arena = arena_state, .shell = .{}, .workers = workers };
+}
+
+/// Joins argv into the single string the shell will be handed.
+///
+/// Every argument is quoted, because by the time devrun sees them the user's
+/// own shell has already split and unquoted them. Joining with plain spaces
+/// would let the shell split a second time, so `node -e "print('a b')"` would
+/// arrive as two arguments and fail in a way that looks like the program's
+/// fault rather than devrun's.
+///
+/// Arguments made only of characters no shell reacts to are left bare, so the
+/// common case stays readable in `devrun config` and in the TUI's title.
+pub fn shellJoin(gpa: Allocator, argv: []const []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+
+    for (argv, 0..) |arg, i| {
+        if (i > 0) try out.append(gpa, ' ');
+        if (arg.len > 0 and isBareSafe(arg)) {
+            try out.appendSlice(gpa, arg);
+            continue;
+        }
+        // Single quotes suspend every other kind of expansion, so the only
+        // byte needing care is a single quote itself: close, escape, reopen.
+        try out.append(gpa, '\'');
+        for (arg) |c| {
+            if (c == '\'') {
+                try out.appendSlice(gpa, "'\\''");
+            } else {
+                try out.append(gpa, c);
+            }
+        }
+        try out.append(gpa, '\'');
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn isBareSafe(arg: []const u8) bool {
+    for (arg) |c| {
+        const ok = std.ascii.isAlphanumeric(c) or switch (c) {
+            '-', '_', '.', '/', '=', ':', ',', '+', '@', '%' => true,
+            else => false,
+        };
+        if (!ok) return false;
+    }
+    return true;
+}
+
 /// Reads and validates `path`. `error.Invalid` means the config was rejected
 /// and `diag` holds the reason, allocated with `gpa` for the caller to free.
 pub fn load(gpa: Allocator, path: []const u8, opts: Options, diag: ?*Diagnostic) !Config {
@@ -741,6 +819,85 @@ fn loadForTest(
         .{ .io = threaded.io(), .environ = &environ },
         diag,
     );
+}
+
+test "shellJoin quotes what a second round of splitting would break" {
+    const gpa = testing.allocator;
+
+    // The common case stays bare, so `devrun config` and the TUI's title show
+    // the command the way it was typed.
+    {
+        const s = try shellJoin(gpa, &.{ "pnpm", "run", "dev" });
+        defer gpa.free(s);
+        try testing.expectEqualStrings("pnpm run dev", s);
+    }
+    // A flag with a path or an equals sign is still bare.
+    {
+        const s = try shellJoin(gpa, &.{ "go", "run", "./cmd/api", "--addr=:8080" });
+        defer gpa.free(s);
+        try testing.expectEqualStrings("go run ./cmd/api --addr=:8080", s);
+    }
+    // Runs of spaces survive. The caller's shell already collapsed the ones it
+    // was going to; what is left is inside an argument and belongs there.
+    {
+        const s = try shellJoin(gpa, &.{ "echo", "a  b" });
+        defer gpa.free(s);
+        try testing.expectEqualStrings("echo 'a  b'", s);
+    }
+    // The only byte single quotes cannot carry is a single quote: close,
+    // escape, reopen. This is the case that breaks a naive join.
+    {
+        const s = try shellJoin(gpa, &.{ "node", "-e", "print('hi')" });
+        defer gpa.free(s);
+        try testing.expectEqualStrings("node -e 'print('\\''hi'\\'')'", s);
+    }
+    // Shell metacharacters inside an argument stay data rather than becoming
+    // syntax, which is the difference between passing a glob to a program and
+    // having the shell expand it first.
+    {
+        const s = try shellJoin(gpa, &.{ "grep", "-E", "panic|ERROR", "*.log" });
+        defer gpa.free(s);
+        try testing.expectEqualStrings("grep -E 'panic|ERROR' '*.log'", s);
+    }
+    // An empty argument is a real argument and must survive as one.
+    {
+        const s = try shellJoin(gpa, &.{ "sh", "-c", "" });
+        defer gpa.free(s);
+        try testing.expectEqualStrings("sh -c ''", s);
+    }
+    // And the shapes that would let a value escape into the command line.
+    {
+        const s = try shellJoin(gpa, &.{ "echo", "a; rm -rf /", "$HOME", "`id`" });
+        defer gpa.free(s);
+        try testing.expectEqualStrings("echo 'a; rm -rf /' '$HOME' '`id`'", s);
+    }
+}
+
+test "adhoc builds a Config the Supervisor cannot tell from a parsed one" {
+    var cfg = try adhoc(testing.allocator, .{
+        .name = "web",
+        .command = "pnpm run dev",
+        .restart = .always,
+        .ready_log_line = "listening on",
+    });
+    defer cfg.deinit();
+
+    try testing.expectEqual(@as(usize, 1), cfg.workers.len);
+    try testing.expectEqualStrings("web", cfg.workers[0].name);
+    try testing.expectEqualStrings("pnpm run dev", cfg.workers[0].command);
+    try testing.expectEqual(Restart.always, cfg.workers[0].restart);
+    try testing.expectEqualStrings("listening on", cfg.workers[0].ready_log_line.?);
+    try testing.expectEqual(@as(?usize, 0), cfg.find("web"));
+
+    // Defaults come from the same struct a YAML Worker gets, so an ad-hoc run
+    // shuts down the way every other Worker does.
+    try testing.expectEqual(@as(u8, 15), cfg.workers[0].shutdown.signal);
+    try testing.expectEqual(@as(u32, 10), cfg.workers[0].shutdown.timeout_seconds);
+    try testing.expectEqualStrings("bash", cfg.shell.command);
+
+    // Strings are owned by the Config's arena, not borrowed from the caller.
+    // `devrun run` frees the joined command right after building this.
+    try testing.expect(cfg.workers[0].command.ptr != @as([*]const u8, "pnpm run dev"));
 }
 
 test "parses the athena config shape" {

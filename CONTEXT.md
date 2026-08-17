@@ -32,6 +32,14 @@ _Avoid_: log file, sink, output, dump
 The slice of an Archive held in memory, bounded in bytes rather than lines. A cache of the Archive, never the record itself.
 _Avoid_: buffer, scrollback, tail, ring
 
+**Index**:
+The `.idx` sidecar beside an Archive: when each chunk of output was written. Everything an Archive cannot say, because saying it would stop the Archive being byte-faithful.
+_Avoid_: timestamps file, metadata, journal, offsets
+
+**Chunk**:
+One read off a Worker's pipe, and the unit an Index stamps. Every line in a chunk shares its time.
+_Avoid_: batch, block, record, frame
+
 **Excerpt**:
 What one copy operation produces. Its shape is decided by the view it was taken from, not by a setting.
 _Avoid_: selection, clipboard contents, yank, snippet

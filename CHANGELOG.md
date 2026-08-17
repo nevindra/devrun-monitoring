@@ -8,7 +8,85 @@ and internal tidying stay in the git log, which is where they are useful.
 
 ## Unreleased
 
-Nothing yet.
+devrun now reads out loud as well as it writes. The Archives were always plain
+files; what was missing was a way to ask them a question — across every
+process at once, over a time window, without spending a context window on the
+answer.
+
+### Every process's output, merged by time
+
+- **`devrun logs` prints the logs.** With no arguments: every process,
+  interleaved in the order things actually happened, which is the view you
+  cannot get by running one dev server in one terminal.
+- `--since 30s`, `--tail N`, `--all`, `--grep 'panic|ERROR'`, `-i`, `--json`.
+- Merging is backed by a new `.devrun/logs/<name>.idx` sidecar recording when
+  each chunk of output was written. The Archive is untouched and still
+  byte-faithful — see [ADR 0006](docs/adr/0006-time-beside-the-bytes.md) for
+  why time lives beside the bytes rather than in them.
+- **Breaking:** `devrun logs NAME` used to print the Archive's path. That is
+  now `devrun logs NAME --path`.
+
+### Output that costs less to read
+
+The default view drops what only a terminal was ever going to act on. On a
+realistic dev workload — a Vite reload loop, a rebuild loop, 50 request log
+lines, a progress bar, and one minified bundle line — the four log files came
+to **153 lines and 19,880 bytes**; `devrun logs --all` renders the same content
+in **6 lines and 1,447 bytes**.
+
+- ANSI escapes stripped (`--raw` keeps them).
+- A progress bar that rewrote itself in place shows its final state, not every
+  frame it drew.
+- Consecutive identical lines fold into one plus a count: `rebuilding… ×40`.
+- A single line past 1200 bytes is clipped with the byte count that was cut
+  (`--max-line N`, or `0` for no limit).
+- Bounded to the last 100 lines by default, 1000 with `--since`.
+- Nothing is dropped silently: a note on stderr says how much was folded,
+  clipped, or left behind, and `--raw --all` puts all of it back.
+
+### One command, no config file
+
+**`devrun run pnpm dev`** supervises a single ad-hoc command. No
+`process-compose.yaml` required, which means devrun now does something in a
+repo that does not have one. Works with anything you can type in a shell:
+`devrun run go run ./cmd/api`, `devrun run bun run dev`, `devrun run cargo watch`.
+
+- Everything else follows from it: the Archive, the Index, and therefore
+  `devrun logs`, `errors`, `status`, `wait` and `--detach`.
+- Exits with the command's own exit status, including `128 + signal` when it
+  is killed, so it works as a wrapper in a script or a Makefile.
+- `--name`, `--cwd`, `--restart POLICY`, `--ready-log TEXT`.
+- The command's words are passed through untouched. `devrun run pnpm dev --json`
+  gives `--json` to pnpm, not to devrun, and devrun's own flags go before the
+  command. Each word is quoted for the shell, so `devrun run node -e "f('a b')"`
+  arrives as one argument rather than being split a second time. `--shell`
+  turns that off for `devrun run --shell 'sleep 1; echo hi'`.
+- One Worker gets no name column and no state commentary, so `devrun run`
+  looks like running the command directly.
+
+`devrun logs` now finds its processes from the config, or from a running
+Session, or from the log directory, in that order. That is what lets it work
+against an ad-hoc run both while it is going and after it has finished.
+
+### Commands for callers that are not people
+
+- **`devrun up --detach`** runs the Session in the background and returns once
+  every process is ready, non-zero if one fails. A process with a readiness
+  probe is not counted ready until the probe says so.
+- **`devrun wait [--timeout D]`** blocks on an already-running Session.
+- **`devrun down`** shuts one down through the same ladder `q` uses.
+- **`devrun errors`** answers "did anything break" in one call: what is broken,
+  its exit code, the tail of its log, and any error-shaped lines from processes
+  that are still up. Exits non-zero while anything is broken.
+- **`devrun status`** is now one aligned line per process instead of raw
+  columns, and `--json` gives one object per process with a `broken` flag.
+  The socket's own reply gained exit-code, uptime, and readiness columns. The
+  last one is what lets `wait` tell "running, and that is all it will ever be"
+  from "running, probe has not passed yet" without reading the config.
+- **`devrun init`** writes a short devrun section into `AGENTS.md` (or
+  `CLAUDE.md`, whichever the repo has), between markers so it can be re-run.
+- An unrecognised `--flag` is now an error rather than being read as a process
+  name, matching how the config loader treats fields it does not understand.
 
 ## 0.1.0
 

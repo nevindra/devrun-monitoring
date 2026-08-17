@@ -276,9 +276,15 @@ pub const Supervisor = struct {
                 .{ opts.log_dir, spec.name },
                 0,
             );
+            const index_path = try std.fmt.allocPrintSentinel(
+                arena,
+                "{s}/{s}.idx",
+                .{ opts.log_dir, spec.name },
+                0,
+            );
             rt.* = .{
                 .spec = spec,
-                .archive = Archive.create(gpa, path.ptr, window_bytes) catch {
+                .archive = Archive.create(gpa, path.ptr, index_path.ptr, window_bytes) catch {
                     return failWith(gpa, diag, "cannot write Archive {s}", .{path});
                 },
             };
