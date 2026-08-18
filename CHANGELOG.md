@@ -56,14 +56,27 @@ one. Anything you can type in a shell: `devrun run go run ./cmd/api`,
 
 ### Keeps the logs
 
-- Every process writes to `.devrun/logs/<name>.log` from the moment it spawns:
-  a plain file, byte-faithful, ANSI intact, readable with `tail -f`, `grep`,
-  `less` and your editor while the Session runs.
+- Every process writes to `.devrun/logs/latest/<name>.log` from the moment it
+  spawns: a plain file, byte-faithful, ANSI intact, readable with `tail -f`,
+  `grep`, `less` and your editor while the Session runs.
 - The in-memory Window is a bounded cache (1 MB across all Workers, `--window-bytes`
   to change it), not the record. Scrolling past it reads the file with `pread`,
   so scrollback reaches the start of the run rather than the end of a buffer.
-- `devrun logs NAME --path` prints the Archive's path, and hands you off to the
-  tools that already read files better than devrun would.
+- **Every run writes to its own directory**, `.devrun/logs/<timestamp>/`, with
+  `.devrun/logs/latest` pointing at the newest. Restarting to reproduce a bug
+  does not delete the log of the run you were reproducing. See
+  [ADR 0006](docs/adr/0006-an-archive-per-session.md).
+- `devrun up` keeps the newest **10** runs and says how many it deleted.
+  `--keep N` changes that; `--keep 0` keeps every one of them.
+- **Quitting the TUI offers to delete saved logs**: `y` for all of them, `o` for
+  every run but the one that just finished, Enter to keep. The offer comes after
+  shutdown, so a habitual `q q` still leaves without deleting anything.
+- **`devrun clean`** does the same from a shell, for anyone who leaves by
+  Ctrl-C. `--all` includes the newest run, and is refused while a Session is
+  running.
+- `devrun logs NAME --path` prints the Archive's path through the `latest`
+  symlink, so it stays true tomorrow, and hands you off to the tools that
+  already read files better than devrun would.
 
 ### Every process's output, merged by time
 
@@ -71,9 +84,9 @@ one. Anything you can type in a shell: `devrun run go run ./cmd/api`,
   interleaved in the order things actually happened, which is the view you
   cannot get by running one dev server in one terminal.
 - `--since 30s`, `--tail N`, `--all`, `--grep 'panic|ERROR'`, `-i`, `--json`.
-- Merging is backed by a `.devrun/logs/<name>.idx` sidecar recording when each
-  chunk of output was written. The Archive is untouched and still
-  byte-faithful — see [ADR 0006](docs/adr/0006-time-beside-the-bytes.md) for
+- Merging is backed by a `.devrun/logs/latest/<name>.idx` sidecar recording when
+  each chunk of output was written. The Archive is untouched and still
+  byte-faithful — see [ADR 0007](docs/adr/0007-time-beside-the-bytes.md) for
   why time lives beside the bytes rather than in them.
 - The processes to read are found from the config, or from a running Session,
   or from the log directory, in that order. That is what lets `devrun logs`
@@ -100,9 +113,21 @@ in **6 lines and 1,447 bytes**.
 
 ### Shows what is happening
 
-- A TUI over those files: log pane at full width, drag or `v` to pick lines,
-  `y` to copy over OSC 52 — so it lands on the clipboard of the machine you
-  are sitting at, through SSH and tmux. Excerpts go out as plain text.
+- A TUI over those files, with the log pane at full width.
+- **There is a Focus — the service list, or a log — and the arrows act on
+  whichever has it.** In the list they walk services; in a log they walk lines.
+  `→` goes into the log, `←` comes back out.
+- **`v` starts a selection at the line the cursor is on**, not at the top of the
+  screen. Picking a stack trace out of a busy log does not mean scrolling until
+  the line you want happens to be the first one.
+- **`y` copies.** Inside a log with nothing selected it takes the line you are
+  on; from the service list it takes the screenful on show. Copy goes over
+  OSC 52, so it lands on the clipboard of the machine you are sitting at,
+  through SSH and tmux. Excerpts go out as plain text.
+- A single click in the log moves the cursor rather than starting a one-line
+  selection, so a stray click cannot leave a selection behind for the next `y`.
+- The footer changes with the Focus and names the arrow keys, so what you can do
+  is on screen rather than behind `?`.
 - Per-Worker CPU, memory and disk I/O across the whole process tree. CPU is
   read per-pid and counts children already reaped, so a Worker that forks per
   unit of work no longer reports 0% while pinning a core. Memory is PSS on a

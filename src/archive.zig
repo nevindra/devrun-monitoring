@@ -6,8 +6,9 @@
 //! moment they are read from the Worker's pipe, byte-faithful with their ANSI
 //! intact, so `tail -f` and `grep` see exactly what the TUI sees.
 //!
-//! Because the Archive is truncated once per Session, an absolute byte offset
-//! *is* a file offset. That single equality removes every index this would
+//! Because an Archive belongs to exactly one Session — `store.zig` gives every
+//! Session its own directory, so this file is always a new one — an absolute
+//! byte offset *is* a file offset. That single equality removes every index this would
 //! otherwise need: `readAt` serves from the Window when the offset is still
 //! resident and `pread`s the page cache when it is not, and no caller has to
 //! know which happened.
@@ -274,12 +275,22 @@ pub const Archive = struct {
     /// taking the Session down for.
     write_failed: bool = false,
 
-    /// Opens `path`, truncating it: an Archive covers one Session, so the
-    /// previous run's bytes are not silently prepended to this one's.
+    /// Opens `path`, which `store.openSession` has already made unique to this
+    /// Session, and truncates it.
     ///
-    /// `index_path` gets the `.idx` sidecar. Null skips it, and a sidecar that
-    /// cannot be created is skipped too rather than failing the Archive — the
-    /// log is the record, the Index only makes it faster to query.
+    /// The truncation is not there to rotate anything any more — that is the
+    /// store's job now, and in the normal case this file did not exist a
+    /// moment ago. It is there to hold the invariant the rest of this file
+    /// rests on: the Window's offsets start at zero, so the file's first byte
+    /// has to be this Session's first byte. Opening an Archive that somehow
+    /// already had bytes in it without truncating would make every `pread` in
+    /// `readAt` read the wrong place.
+    ///
+    /// `index_path` gets the `.idx` sidecar, which belongs in the same Session
+    /// directory as the log it describes: its offsets are only meaningful
+    /// against these bytes. Null skips it, and a sidecar that cannot be created
+    /// is skipped too rather than failing the Archive — the log is the record,
+    /// the Index only makes it faster to query.
     pub fn create(
         gpa: Allocator,
         path: [*:0]const u8,

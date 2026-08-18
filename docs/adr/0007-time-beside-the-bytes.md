@@ -1,6 +1,6 @@
 # Time lives beside the bytes, in a sidecar, not inside the Archive
 
-Each Worker gets a second file next to its Archive: `.devrun/logs/<name>.idx`, holding fixed-width `(wall_ms, byte_offset)` records, one per chunk read off the Worker's pipe. `devrun logs` binary-searches it to answer `--since`, and to interleave several Archives into one stream ordered by time.
+Each Worker gets a second file next to its Archive: `.devrun/logs/latest/<name>.idx`, holding fixed-width `(wall_ms, byte_offset)` records, one per chunk read off the Worker's pipe. `devrun logs` binary-searches it to answer `--since`, and to interleave several Archives into one stream ordered by time.
 
 The Archive itself does not change. It stays byte-faithful with its ANSI intact, which is what ADR 0001 bought and what `tail -f`, `grep` and a pager all depend on. The moment a timestamp is interleaved into that file it is no longer what the Worker said, and every tool pointed at it is reading devrun's output rather than the service's.
 
@@ -23,6 +23,6 @@ That is the whole reason the format has no framing, no compression, and no text.
 ## Consequences
 
 - An Archive with no sidecar still works. `IndexReader` treats missing, foreign, or truncated files as empty, and a Worker with no Index appears in merged output with no timestamp, sorted after everything that has one. Losing a Worker's *position* is a small failure; dropping its output would be a large one.
-- The sidecar is truncated per Session, exactly like the Archive, because last run's offsets describe nothing in this one.
+- A sidecar's offsets only mean anything against the exact bytes they were written for, so it lives in the same Session directory as its Archive and is created, kept and deleted with it (ADR 0006). Reading is done through the `latest` symlink, so nothing that queries a log has to work out which stamped directory is the current one.
 - Wall-clock time, not `CLOCK_MONOTONIC`. Every deadline in devrun is monotonic and should stay that way, but a stamp is a label read by a *different process* started at a different time, and a monotonic reading cannot be printed or compared across a reboot. A clock that steps mislabels a few lines; a monotonic stamp cannot be read at all.
 - `--since` rounds outwards at the front, including the chunk that straddles the cutoff, so the first lines shown may slightly predate the request. Clipping the line that explains the failure is the worse error. The exception is the final chunk: it has no successor to straddle the cutoff with, so if it is older than the cutoff, nothing qualifies — otherwise a Worker that went quiet an hour ago would answer every `--since 30s` with its last words forever.

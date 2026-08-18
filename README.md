@@ -47,10 +47,10 @@ devrun answers that question, because it never had the logs anywhere else.
 view over those files, not their owner.
 
 ```
-                  ┌─ .devrun/logs/<name>.log ──→ tail · grep · less · $EDITOR
-process ──stdout──┤                          ──→ devrun logs · errors
-                  ├─ .devrun/logs/<name>.idx ──→ when each chunk was written
-                  └─ in-memory window (1 MB)  ──→ TUI, scrolls past it via pread
+                  ┌─ .devrun/logs/latest/<name>.log ──→ tail · grep · less · $EDITOR
+process ──stdout──┤                                 ──→ devrun logs · errors
+                  ├─ .devrun/logs/latest/<name>.idx ──→ when each chunk was written
+                  └─ in-memory window (1 MB)         ──→ TUI, scrolls past it via pread
 
 .devrun/control.sock ──→ start · stop · restart · status · samples · down
                                                             (never logs)
@@ -60,6 +60,13 @@ Two things follow from that shape. Logs never cross the socket, so the socket
 stays a trivial line protocol with no framing, no subscriptions, no backpressure.
 And the in-memory window is a bounded cache rather than the record, so scrolling
 past it reads from the page cache at RAM speed without counting toward RSS.
+
+**Every run gets its own directory**, named for when it started, with `latest`
+aimed at the newest. Restarting to reproduce a bug does not delete the log of
+the run you were reproducing, which is what it used to do. `devrun up` keeps the
+newest ten and says how many it dropped; `--keep N` changes that and `--keep 0`
+keeps every one. `devrun clean` clears them from a shell, and quitting the TUI
+offers to do the same.
 
 ## Install
 
@@ -252,25 +259,39 @@ for: read a log, take lines out of it, and see which process is working.
 │ ● parser  running    2m 13s    1.6 GB     4 █  99.8%        -         -     │
 │ ✗ worker  failed         12s        -     -        -        3    killed     │
 │  memory  1.3 GB across 6 processes   firecracker 874 MB   go 58 MB …        │
-├─ go  .devrun/logs/go.log ───────────────────────────────────────────────────┤
+├─ ▸ go  .devrun/logs/latest/go.log ──────────────────────────────────────────┤
 │  {"time":"09:31:33","level":"info","msg":"migrations up to date"}           │
 │▌ {"time":"09:31:33","level":"warn","msg":"embedding provider not set"}      │
-│▌ {"time":"09:31:33","level":"info","msg":"storage connected"}               │
+│▸ {"time":"09:31:33","level":"info","msg":"storage connected"}               │
 └─────────────────────────────────────────────────────────────────────────────┘
-   ↑ picked lines
+ ↑↓ line · v select · y copy              ↑↓ Line  v Select  y Copy  ← Back  …
 ```
 
-| key | what it does |
+`▌` is a picked line and `▸` is the one the cursor is on. The `▸` in the box
+title says the arrow keys are talking to the log rather than to the list above.
+
+Two places to be — the service list and a log — and the arrow keys mean
+whichever one you are in. `→` goes into the log, `←` comes back out, and the
+footer says which keys are live where you are standing, so `?` is for the whole
+list rather than for finding the key you needed.
+
+| | |
 |---|---|
-| drag, or `v` then `↑` / `↓` | pick lines |
-| `y` | copy: the picked lines, or the visible pane |
-| Esc | let the picked lines go |
-| click, Tab, `n` / `p`, `←` / `→` | switch process |
-| wheel, `j` / `k`, `↑` / `↓`, PgUp / PgDn | scroll |
+| `↑` / `↓` | another service, in the list — another line, in a log |
+| `→` / `←` | go into the log, come back to the list |
+| click, Tab, `n` / `p` | switch process from anywhere |
+| `y` | copy — the line you are on, or the lines you picked |
+| `v` then `↑` / `↓`, or drag | pick a range of lines |
+| Esc | let the picked lines go; again to leave the log |
+| wheel, `j` / `k`, PgUp / PgDn | move through the log |
 | Home / End, `g` / `G` | jump to the start, or back to live |
 | `s` / `r` / `S` | stop, restart, start this process |
 | `?` | every key, spelled out |
 | `q` | shut the Session down; again to leave immediately |
+
+`y` takes the line the cursor is on, and `v` starts a selection *there*, not at
+the top of the screen. Picking a stack trace out of a busy log is no longer a
+matter of scrolling until the line you want happens to be the first one.
 
 **Copy goes out over OSC 52**, so it lands on the clipboard of the machine you
 are sitting at, through SSH and tmux. It takes whole lines, never the borders or
@@ -504,7 +525,8 @@ The non-obvious choices are written down with the reasoning that produced them:
 - [Zig, not Rust](docs/adr/0003-zig-over-rust.md). The score was near-even, and the tiebreaker was not technical.
 - [Portable by construction, Linux-only by scope](docs/adr/0004-portability-posture.md)
 - [Render log bytes straight through, not through a cell grid](docs/adr/0005-render-log-bytes-through.md). Why the TUI is hand-written, against 0003.
-- [Time lives beside the bytes, in a sidecar](docs/adr/0006-time-beside-the-bytes.md). How `--since` and merging work without touching the Archive.
+- [Every Session gets its own directory of Archives](docs/adr/0006-an-archive-per-session.md). Why reproducing a bug stopped deleting the evidence.
+- [Time lives beside the bytes, in a sidecar](docs/adr/0007-time-beside-the-bytes.md). How `--since` and merging work without touching the Archive.
 
 [`CONTEXT.md`](CONTEXT.md) is the glossary: what a Worker, a Group, a Gate, an
 Archive, and a Window each mean here, and which words are deliberately avoided.

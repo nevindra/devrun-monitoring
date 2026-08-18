@@ -162,8 +162,12 @@ pub const Options = struct {
     /// Directory the config was read from; `dotenv` paths and the default
     /// working directory resolve against it.
     base_dir: []const u8,
-    /// Where Archives are written.
+    /// Where this Session's Archives are written — its own directory under
+    /// `log_root`, made by `store.openSession`.
     log_dir: []const u8,
+    /// The directory those Session directories live in. Carried so a view can
+    /// offer to tidy up every Session on the way out, not only this one.
+    log_root: []const u8 = "",
     /// What to call this Session on screen. The directory the config was read
     /// from, which is what a reader has several of open at once.
     project: []const u8 = "",
@@ -211,6 +215,8 @@ pub const Supervisor = struct {
     /// which file it is looking at — the answer to "can I send you this log?"
     /// is a path, and it should not be something they have to already know.
     log_dir: []const u8,
+    /// Where every Session's Archives live, this one's included.
+    log_root: []const u8,
     /// What this Session is called on screen.
     project: []const u8,
 
@@ -345,6 +351,7 @@ pub const Supervisor = struct {
             .devnull = devnull,
             .shell = .{ .path = shell_path.ptr, .argument = cfg.shell.argument },
             .log_dir = try arena.dupe(u8, opts.log_dir),
+            .log_root = try arena.dupe(u8, opts.log_root),
             .project = try arena.dupe(u8, opts.project),
             // Worst case each Worker contributes an output pipe and a probe
             // socket, plus the signal pipe and room for the caller's own.

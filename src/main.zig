@@ -12,6 +12,12 @@ const tui = @import("tui.zig");
 const term = @import("term.zig");
 const sample = @import("sample.zig");
 const update = @import("update.zig");
+const store = @import("store.zig");
+
+/// A byte count as a person would say it. Shared with the TUI rather than
+/// written twice: "48 MB" should read the same whether it came from a footer
+/// or from `devrun clean`.
+const humanBytes = tui.humanBytes;
 
 /// The vendored YAML parser logs every token it sees at `.debug`, which in a
 /// Debug build buries anything we print. Its warnings are still worth having.
@@ -38,6 +44,7 @@ const usage =
     \\  devrun samples                  Per-process CPU, memory, and disk I/O
     \\  devrun config [FILE]            What devrun understood from a config
     \\  devrun start|stop|restart NAME  Act on one process of a running Session
+    \\  devrun clean [--all]            Delete saved logs from previous runs
     \\  devrun init [-o FILE]           Write the agent instructions into AGENTS.md
     \\  devrun update                   Replace this binary with the latest release
     \\  devrun version                  Print the version and exit
@@ -71,13 +78,16 @@ const usage =
     \\  --detach, -d       Run the Session in the background and return once
     \\                     every process is ready
     \\  --timeout D        How long `wait` and `up --detach` give it (default 2m)
+    \\  --keep N           Log directories to keep from previous runs (default 10).
+    \\                     0 keeps every one of them.
     \\  --window-bytes N   In-memory log cache across all processes (default 1M).
     \\                     Accepts K/M/G. Scrollback past it is read from the
     \\                     log file, so this trades RSS for nothing much.
     \\
-    \\Logs are files. `.devrun/logs/<name>.log` is a plain file being appended
-    \\to right now — tail it, grep it, open it in an editor. `devrun logs`
-    \\merges them by time and trims the noise; `--raw --all` gives them back.
+    \\Logs are files. Every run writes to its own directory, and
+    \\`.devrun/logs/latest/<name>.log` is the one being appended to right now —
+    \\tail it, grep it, open it in an editor. `devrun logs` merges them by time
+    \\and trims the noise; `--raw --all` gives them back.
     \\
 ;
 
@@ -112,6 +122,11 @@ pub fn main(init: std.process.Init) !u8 {
                 .{},
             ),
             error.BadCount => try err(io, "devrun: --tail and --max-line need a number\n", .{}),
+            error.BadKeep => try err(
+                io,
+                "devrun: --keep needs a count, like 10, or 0 to keep every run\n",
+                .{},
+            ),
             error.BadRestart => try err(
                 io,
                 "devrun: --restart takes no, always, on_failure, or exit_on_failure\n",
@@ -146,6 +161,7 @@ pub fn main(init: std.process.Init) !u8 {
     if (std.mem.eql(u8, cmd, "errors")) return cli.showErrors(out);
     if (std.mem.eql(u8, cmd, "wait")) return cli.waitReady(out);
     if (std.mem.eql(u8, cmd, "down")) return cli.ask(out, "down", null);
+    if (std.mem.eql(u8, cmd, "clean")) return cli.clean(out);
     if (std.mem.eql(u8, cmd, "init")) return cli.writeAgentDoc(out);
     if (std.mem.eql(u8, cmd, "update")) return update.run(gpa, io, init.environ_map, out);
     if (std.mem.eql(u8, cmd, "version") or std.mem.eql(u8, cmd, "--version")) {
@@ -183,6 +199,9 @@ const Cli = struct {
     /// Zero means "whatever the Supervisor's default is", so the default lives
     /// in one place rather than being restated here.
     window_bytes: usize = 0,
+    /// How many previous runs' log directories survive the next `devrun up`.
+    /// Zero means all of them; see `store.prune`.
+    keep: usize = default_keep,
 
     detach: bool = false,
     timeout_ms: u64 = 2 * 60 * 1000,
@@ -202,6 +221,10 @@ const Cli = struct {
     since_ms: ?u64 = null,
     tail: ?usize = null,
     tail_given: bool = false,
+    /// `logs` and `errors` read this as "no line limit". `clean` reads it as
+    /// "take the newest run too". One flag, and the verb in front of it decides
+    /// which question it is answering — two fields that had to hold the same
+    /// bool would only ever drift apart.
     all: bool = false,
     grep: ?[]const u8 = null,
     ignore_case: bool = false,
@@ -313,6 +336,10 @@ const Cli = struct {
                 i += 1;
                 if (i >= args.len) return error.BadCount;
                 self.max_line = std.fmt.parseInt(usize, args[i], 10) catch return error.BadCount;
+            } else if (std.mem.eql(u8, a, "--keep")) {
+                i += 1;
+                if (i >= args.len) return error.BadKeep;
+                self.keep = std.fmt.parseInt(usize, args[i], 10) catch return error.BadKeep;
             } else if (std.mem.eql(u8, a, "--window-bytes")) {
                 i += 1;
                 if (i >= args.len) return error.BadWindowBytes;
@@ -360,6 +387,24 @@ const Cli = struct {
 
     fn baseDir(self: Cli) []const u8 {
         return std.fs.path.dirname(self.path) orelse ".";
+    }
+
+    /// Where this run's Archives are, for everything that reads them back.
+    ///
+    /// Through the `latest` symlink rather than the stamped directory behind
+    /// it. Every reader here is answering a question about the run happening
+    /// now, and resolving the newest stamp itself would mean each of them
+    /// reimplementing `store.list`'s ordering and disagreeing with it sooner or
+    /// later. It also keeps `--path` printing a path worth pasting somewhere,
+    /// which is the whole reason the symlink exists.
+    ///
+    /// Caller owns the result.
+    fn logsDir(self: Cli) ![]const u8 {
+        return std.fmt.allocPrint(self.gpa, "{s}/{s}/{s}", .{
+            self.baseDir(),
+            log_dir_suffix,
+            store.latest_link,
+        });
     }
 
     fn load(self: Cli, diag: *config.Diagnostic) !config.Config {
@@ -433,7 +478,7 @@ const Cli = struct {
     /// round trip for anything reading the log itself, so the path moved to
     /// `--path` and the contents became the default.
     fn showLogs(self: Cli, out: *std.Io.Writer, names: []const []const u8) !u8 {
-        const dir = try std.fmt.allocPrint(self.gpa, "{s}/{s}", .{ self.baseDir(), log_dir_suffix });
+        const dir = try self.logsDir();
         defer self.gpa.free(dir);
 
         const known = self.knownWorkers(dir) catch |e| {
@@ -591,7 +636,7 @@ const Cli = struct {
         var reply_buf: [64 << 10]u8 = undefined;
         const reply = self.askRaw("status\n", &reply_buf) catch return 1;
 
-        const dir = try std.fmt.allocPrint(self.gpa, "{s}/{s}", .{ self.baseDir(), log_dir_suffix });
+        const dir = try self.logsDir();
         defer self.gpa.free(dir);
 
         const broken = try report.writeErrors(self.gpa, reply, .{
@@ -683,6 +728,59 @@ const Cli = struct {
             try err(self.io, "devrun: something failed. `devrun errors` has the log.\n", .{});
             return 1;
         }
+        return 0;
+    }
+
+    // ----------------------------------------------------------- clean
+
+    /// Deletes saved logs. The counterpart to the offer the TUI makes on the
+    /// way out, for everyone who leaves by Ctrl-C, closes the terminal, or
+    /// never sees a TUI at all.
+    ///
+    /// No prompt: a command someone typed is already the confirmation, and one
+    /// that asks again is one that cannot be put in a script.
+    fn clean(self: Cli, out: *std.Io.Writer) !u8 {
+        const dirs = try Dirs.init(self.gpa, self.baseDir());
+        defer dirs.deinit(self.gpa);
+
+        // Deleting the Archives out from under a Session that is writing them
+        // leaves it appending to files no path reaches any more. `--all` is
+        // the only scope that can do it, so it is the only one that is
+        // refused; plain `clean` keeps the newest run, which is that Session.
+        if (self.all) {
+            var probe_buf: [4096]u8 = undefined;
+            if (control.ask(dirs.sock, "status\n", &probe_buf)) |_| {
+                try err(self.io,
+                    "devrun: a Session is running here — its logs are being written to.\n" ++
+                    "        Stop it first, or run `devrun clean` to keep just that one.\n",
+                    .{},
+                );
+                return 1;
+            } else |_| {}
+        }
+
+        const before = store.usage(self.gpa, dirs.logs);
+        if (before.sessions == 0) {
+            try out.print("No saved logs in {s}\n", .{dirs.logs});
+            return 0;
+        }
+
+        const removed = store.clean(self.gpa, dirs.logs, if (self.all) .all else .older);
+        if (removed.sessions == 0) {
+            try out.print(
+                "Kept the only run in {s} — `devrun clean --all` deletes it too\n",
+                .{dirs.logs},
+            );
+            return 0;
+        }
+
+        var size_buf: [32]u8 = undefined;
+        try out.print("Deleted {d} run{s} ({s}) from {s}\n", .{
+            removed.sessions,
+            if (removed.sessions == 1) "" else "s",
+            humanBytes(&size_buf, removed.bytes),
+            dirs.logs,
+        });
         return 0;
     }
 
@@ -867,11 +965,21 @@ const Cli = struct {
             named
         else if (os.getcwd(&cwd_buf)) |cwd| std.fs.path.basename(cwd) else "";
 
+        // This run's own directory, made before anything spawns so no Worker
+        // is writing while the store decides what it may delete.
+        const session_dir = store.openSession(self.gpa, dirs.logs, os.wallSeconds()) catch |e| {
+            try err(self.io, "devrun: cannot make a log directory under {s}: {t}\n", .{ dirs.logs, e });
+            return 1;
+        };
+        defer self.gpa.free(session_dir);
+        const pruned = store.prune(self.gpa, dirs.logs, self.keep);
+
         var opts: supervisor.Options = .{
             .io = self.io,
             .environ = self.environ,
             .base_dir = base,
-            .log_dir = dirs.logs,
+            .log_dir = session_dir,
+            .log_root = dirs.logs,
             .project = project,
         };
         if (self.window_bytes > 0) opts.window_budget = self.window_bytes;
@@ -886,8 +994,8 @@ const Cli = struct {
         };
         defer sup.deinit();
 
-        // Two Sessions in one directory would truncate each other's Archives
-        // on startup and fight over every port their Workers bind, so a live
+        // Two Sessions in one directory would fight over every port their
+        // Workers bind and over which of them `devrun stop` means, so a live
         // socket is a refusal rather than a warning. Any *other* failure to
         // open it is not: losing `devrun stop` is no reason to refuse to
         // start anything.
@@ -918,7 +1026,16 @@ const Cli = struct {
                 os.redirectStdio(log);
                 os.close(log);
             }
-            return runPlain(self.gpa, &sup, if (server) |*s| s else null, out, self.io, true, exit_of);
+            return runPlain(
+                self.gpa,
+                &sup,
+                if (server) |*s| s else null,
+                out,
+                self.io,
+                true,
+                exit_of,
+                pruned,
+            );
         }
 
         // A Session of one is a wrapper, not a dashboard. Drawing a table and
@@ -931,7 +1048,9 @@ const Cli = struct {
             // stdout can be a terminal while stdin is not — `devrun up < /dev/null`
             // is the usual way. There is nothing to drive a TUI with then, so
             // fall through to the plain view rather than failing.
-            return tui.run(self.gpa, &sup, if (server) |*s| s else null, self.io) catch |e| switch (e) {
+            return tui.run(self.gpa, &sup, if (server) |*s| s else null, self.io, .{
+                .pruned = pruned.sessions,
+            }) catch |e| switch (e) {
                 error.NotATerminal => runPlain(
                     self.gpa,
                     &sup,
@@ -940,11 +1059,21 @@ const Cli = struct {
                     self.io,
                     false,
                     exit_of,
+                    pruned,
                 ),
                 else => e,
             };
         }
-        return runPlain(self.gpa, &sup, if (server) |*s| s else null, out, self.io, false, exit_of);
+        return runPlain(
+            self.gpa,
+            &sup,
+            if (server) |*s| s else null,
+            out,
+            self.io,
+            false,
+            exit_of,
+            pruned,
+        );
     }
 
     // ----------------------------------------------------------- control
@@ -1027,7 +1156,7 @@ const agent_doc = begin_marker ++
     \\## Running this project's services
     \\
     \\`devrun` runs every service in `process-compose.yaml` at once and keeps
-    \\each one's output in a plain file under `.devrun/logs/`. Prefer it over
+    \\each one's output in a plain file under `.devrun/logs/latest/`. Prefer it over
     \\running a single dev server in the background: with one server you only
     \\see that server's output, and the error is usually in another one.
     \\
@@ -1058,6 +1187,15 @@ const agent_doc = begin_marker ++
     \\with no arguments for the rest.
     \\
 ++ end_marker ++ "\n";
+
+/// Runs whose logs survive the next `devrun up`.
+///
+/// Ten is enough to answer "what did it say yesterday?" without letting
+/// `.devrun` grow for as long as a repo is checked out. Now that every run
+/// keeps its own directory instead of overwriting the one before it, something
+/// has to be the thing that forgets — and a person who never quits through the
+/// TUI would otherwise never delete anything at all.
+const default_keep = 10;
 
 /// The per-Session paths, all under `.devrun/` beside the config.
 const Dirs = struct {
@@ -1093,6 +1231,7 @@ fn runPlain(
     /// Worker whose exit status becomes devrun's own. `devrun run` sets it so
     /// that wrapping a command does not throw away what the command said.
     exit_of: ?usize,
+    pruned: store.Removed,
 ) !u8 {
     var printer = try plain.Printer.init(
         gpa,
@@ -1103,6 +1242,17 @@ fn runPlain(
     // A wrapper's job is the command's output, not a running commentary on it.
     printer.announce = exit_of == null;
     defer printer.deinit(gpa);
+
+    // Said before any Worker's output, because after it nobody would see it.
+    // Deleting somebody's logs silently is the one thing retention must not do.
+    if (pruned.sessions > 0) {
+        var size_buf: [32]u8 = undefined;
+        try out.print("devrun: deleted {d} old log run{s} ({s})\n", .{
+            pruned.sessions,
+            if (pruned.sessions == 1) "" else "s",
+            humanBytes(&size_buf, pruned.bytes),
+        });
+    }
 
     while (!sup.done()) {
         var extra: [control.Server.max_poll_fds]os.PollFd = undefined;
@@ -1167,4 +1317,5 @@ test {
     _ = term;
     _ = sample;
     _ = update;
+    _ = store;
 }

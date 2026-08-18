@@ -91,6 +91,15 @@ pub fn realtimeMs() u64 {
     return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
 }
 
+/// Seconds since the epoch, on `CLOCK_REALTIME`. The other thing that wants the
+/// wall clock rather than `nowMs` is naming a Session's directory, where the
+/// whole point is that a person can read it and know when it ran.
+pub fn wallSeconds() i64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.REALTIME, &ts);
+    return @intCast(ts.sec);
+}
+
 // ------------------------------------------------------------- fds
 
 pub fn close(fd: Fd) void {
@@ -142,9 +151,25 @@ pub fn unlink(path: [*:0]const u8) void {
     _ = linux.unlink(path);
 }
 
-/// Size of an open file. Null rather than an error: every caller is a reader
-/// deciding how much of an Index there is to search, and "none of it" is the
-/// same answer it would take from a failure.
+/// Removes an empty directory. Failure is not reported for the same reason
+/// `unlink`'s is not: every caller is tidying up, and a directory that would
+/// not go is not worth interrupting anyone over.
+pub fn rmdir(path: [*:0]const u8) void {
+    _ = linux.rmdir(path);
+}
+
+/// Points `path` at `target`, replacing whatever `path` was. Two steps because
+/// `symlink` refuses an existing name: the unlink is what makes "latest" a
+/// name that can be re-aimed at each Session rather than one that sticks to
+/// the first.
+pub fn relink(target: [*:0]const u8, path: [*:0]const u8) !void {
+    _ = linux.unlink(path);
+    return check(linux.symlink(target, path));
+}
+
+/// Size of an already-open file. Null rather than an error: every caller is a
+/// reader deciding how much of an Index there is to search, and "none of it" is
+/// the same answer it would take from a failure.
 pub fn fileSize(fd: Fd) ?u64 {
     // `statx` with `AT_EMPTY_PATH` rather than `lseek(SEEK_END)`: an Archive is
     // being appended to by the Session that owns it, and a helper that moved
@@ -155,6 +180,21 @@ pub fn fileSize(fd: Fd) ?u64 {
     if (linux.errno(rc) != .SUCCESS) return null;
     if (!st.mask.SIZE) return null;
     return st.size;
+}
+
+/// How big a file is by path, or zero when it cannot be read.
+///
+/// Opens its own descriptor, so unlike `fileSize` there is no writer's offset
+/// to disturb and `lseek` is free to be the simpler answer: no struct
+/// definition, no feature check. The one caller — adding up what a directory of
+/// Archives costs — is already paying for an open per file.
+pub fn fileBytes(path: [*:0]const u8) u64 {
+    const fd = open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0) catch return 0;
+    defer close(fd);
+    const seek_end = 2;
+    const rc = linux.lseek(fd, 0, seek_end);
+    if (linux.errno(rc) != .SUCCESS) return 0;
+    return @intCast(rc);
 }
 
 /// The working directory, or null when it will not fit or cannot be read.
