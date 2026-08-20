@@ -265,6 +265,12 @@ fn map(self: *Parser, gpa: Allocator) ParseError!Node.OptionalIndex {
 
         // Parse key
         const key_pos = self.token_it.pos;
+        // devrun patch: a document ending on a bare key (`services:` and
+        // nothing after it) leaves the iterator past the last token, and
+        // `getCol` indexes the token array with no bounds check. Exhaustion is
+        // what the `next()` below already calls UnexpectedEof; this only says
+        // so one line earlier, before the out-of-bounds read.
+        if (self.token_it.peek() == null) return error.UnexpectedEof;
         if (self.getCol(key_pos) < col) break;
 
         const key = self.token_it.next() orelse return error.UnexpectedEof;
