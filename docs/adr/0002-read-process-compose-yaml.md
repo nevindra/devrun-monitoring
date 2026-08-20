@@ -1,5 +1,7 @@
 # Read process-compose.yaml directly rather than defining our own config format
 
+**Superseded by [0008](0008-devrun-yml.md).** Kept because the reasoning it was reversed for is only legible next to the reasoning it replaced.
+
 devrun reads the repo's existing `process-compose.yaml`, supports a strict subset of its schema, and fails loudly on any field it does not understand.
 
 The goal is coexistence: a teammate keeps running `process-compose up` against the same repo while we run `devrun up`, and neither has to care. A separate `devrun.yaml` would technically work, but it only converts the problem into permanent manual synchronisation — a service added to one file and forgotten in the other is a bug that surfaces as "works on my machine" weeks later.

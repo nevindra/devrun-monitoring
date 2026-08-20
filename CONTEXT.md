@@ -1,14 +1,16 @@
 # devrun
 
-A process runner for local development: it starts the services a repo needs, shows their logs, and — the reason it exists — lets you get those logs back out. It reads the same `process-compose.yaml` a teammate runs under process-compose.
+A process runner for local development: it starts the services a repo needs, shows their logs, and — the reason it exists — lets you get those logs back out. It reads a `devrun.yml`.
 
 ## Language
 
 ### Processes
 
 **Worker**:
-One entry under `processes:` in the config. A single Worker usually becomes several OS processes.
+One entry under `services:` in the config. A single Worker usually becomes several OS processes.
 _Avoid_: process, service, job, task
+
+The config file and everything a user reads say **service**, not Worker. That split is deliberate: "worker" already means a background job consumer in most stacks, and a `workers:` block containing a service named `worker` reads badly. Worker is the name inside the code, and the _Avoid_ list above applies there in full. See `docs/adr/0008-devrun-yml.md`.
 
 **Group**:
 Every OS process sharing a Worker's process group id. This is the unit that gets measured and the unit that gets killed — never the single pid that was spawned.

@@ -6,6 +6,80 @@ Newest first. Versions follow [semantic versioning](https://semver.org); until
 Entries say what changed for someone *using* devrun. Refactors, test additions
 and internal tidying stay in the git log, which is where they are useful.
 
+## Unreleased
+
+### Breaking: devrun reads `devrun.yml`, not `process-compose.yaml`
+
+devrun no longer reads `process-compose.yaml` and has no compatibility mode.
+It reads `devrun.yml` (or `devrun.yaml`), a format it defines. Having both
+spellings in one repo is refused rather than resolved by precedence.
+
+The compatibility promise cost more than it returned. Every question about the
+config had two answers, and defaults worth fixing were not ours to fix —
+`depends_on` defaulted to "the pid exists" when a dev stack almost always means
+"the database is accepting connections". [ADR 0008](docs/adr/0008-devrun-yml.md)
+has the full reasoning, including why the format stayed YAML rather than moving
+to TOML.
+
+**Migrating.** There is no converter; the schema is small enough to retype.
+
+| was | is |
+|---|---|
+| `processes:` | `services:` |
+| `command:` | `run:` |
+| `working_dir:` | `dir:` |
+| `dotenv: [...]` | `env_file:`, one path or a list |
+| `environment: ["K=V"]` | `env:`, a mapping |
+| `depends_on: {db: {condition: process_healthy}}` | `after: [db]`, or `after:` then `db: ready` |
+| `availability: {restart: X}` | `restart: X` |
+| `readiness_probe.exec.command` | `ready.exec` |
+| `readiness_probe.http_get.{host,scheme,path,port}` | `ready.http`, one URL |
+| `ready_log_line:` | `ready.log` |
+| `initial_delay_seconds` / `period_seconds` / `timeout_seconds` | `delay` / `every` / `timeout`, with units |
+| `success_threshold` / `failure_threshold` | `passes` / `fails` |
+| `shutdown: {signal: 15, timeout_seconds: 10}` | `stop: {signal: SIGTERM, grace: 10s}` |
+| `shell: {shell_command, shell_argument}` | `shell: [bash, -c]` |
+| `version:` | dropped |
+
+The five `depends_on` conditions became four words: `started`, `ready`, `done`,
+`ok`. `process_healthy` and `process_log_ready` are both `ready` now — what
+makes a service Ready is whatever its own `ready:` block says.
+
+### New in the same change
+
+- **A service that is only a command is only a string.** `tailwind: pnpm
+  tailwindcss -w` is the whole entry. It still picks up `defaults`.
+- **`defaults:`** applies to every service, per key, with the service winning.
+  No merging at depth except `env`, which merges per variable.
+- **Durations carry units.** `grace: 5s`, `every: 2m`. A bare number is seconds,
+  as it already is for `--since`. Sub-second is refused rather than rounded.
+- **Signals are named.** `signal: SIGINT`, not `signal: 2`. A number is not
+  portable — SIGUSR1 is 10 on Linux and 30 on macOS.
+- **`ready.http` is one URL.** Both of the probe's limits, plain HTTP only and
+  an IPv4-or-`localhost` host, are now caught while reading the file instead of
+  at spawn.
+- **Waiting on a service with no `ready:` block warns** instead of silently
+  meaning "wait for its pid". The wait still happens; devrun just says what it
+  can and cannot promise.
+- `devrun config` prints the config back in the file's own vocabulary.
+
+### Fixed
+
+- **A config ending on a bare key no longer panics.** `services:` with nothing
+  after it took devrun down with `index out of bounds` from the vendored YAML
+  parser. It is now an error that names the file. Patched locally; see
+  [PROVENANCE.md](src/vendor/yaml/PROVENANCE.md).
+- **A mapping written on one line is refused rather than read as nothing.** The
+  vendored parser resolves `{a: b}` to an empty value, so `after: {db: ready}`
+  used to parse without complaint and produce no dependency at all. Every place
+  expecting a mapping now says what happened and what to write instead.
+
+### Known limitations
+
+- Anchors and aliases (`&base`, `*base`) are not implemented by the vendored
+  parser. `defaults:` covers most of what they are reached for.
+- Mappings must be written across lines, not in `{a: b}` form.
+
 ## 0.1.0
 
 First release. Everything in the original plan is in it.
