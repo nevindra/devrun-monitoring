@@ -9,9 +9,11 @@
 //! loop, which is why a hung probe on one Worker cannot stall another Worker's
 //! logs.
 //!
-//! Attempt bookkeeping follows process-compose: `success_threshold` consecutive
-//! passes make a Worker Ready, `failure_threshold` consecutive failures make it
-//! unhealthy, and either counter resets when the other side scores.
+//! Attempt bookkeeping is hysteresis rather than a single reading: `passes`
+//! consecutive passes make a Worker Ready, `fails` consecutive failures make it
+//! unhealthy, and either counter resets when the other side scores. A service
+//! that answers one request slowly is not down, and one that answers a single
+//! request during a crash loop is not up.
 
 const std = @import("std");
 const os = @import("os.zig");

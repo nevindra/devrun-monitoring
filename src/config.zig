@@ -1,25 +1,29 @@
-//! Reads a `process-compose.yaml` into a Config.
+//! Reads a `devrun.yml` into a Config.
 //!
-//! devrun understands a strict subset of process-compose's schema and refuses
-//! everything outside it. That refusal is the point, not a limitation: a field
-//! we quietly ignored would let two people run the same file and get different
-//! behaviour, with nothing on screen to say why. See
-//! `docs/adr/0002-read-process-compose-yaml.md`.
+//! Every key is listed by hand and anything else is refused by name. That
+//! refusal is the point rather than a limitation: a field quietly ignored is a
+//! setting the author believes is in effect, and the first sign otherwise is a
+//! service behaving in a way nothing on screen explains. See
+//! `docs/adr/0008-devrun-yml.md`.
 //!
-//! Load order matches process-compose exactly, because matching it is the whole
-//! promise:
+//! Load order:
 //!
 //!   1. read `.env` files
 //!   2. expand `${VAR}` / `$VAR` over the *raw file text*, .env winning over the
 //!      OS environment, unset names becoming empty
 //!   3. parse the result as YAML
 //!
-//! Substituting before parsing is textual and therefore slightly dangerous — a
-//! value containing a colon can reshape the document. process-compose does it
-//! this way, so we do too.
+//! Substituting before parsing is textual and therefore blunt: a value holding
+//! a colon or a newline can reshape the document. It stays that way because it
+//! is the only form that can reach a key as easily as a value, and the error a
+//! broken substitution produces names the expansion as a likely cause.
 
 const std = @import("std");
 const Yaml = @import("yaml").Yaml;
+const os = @import("os.zig");
+/// For `parseDuration` alone, so a duration in the config and a duration on the
+/// command line cannot drift into meaning different things.
+const logs_mod = @import("logs.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -27,13 +31,15 @@ const Allocator = std.mem.Allocator;
 /// reached for, so tests can supply a synthetic environment.
 pub const Options = struct {
     io: std.Io,
-    /// The process environment. `.env` values are checked *first*, matching
-    /// process-compose — note that is the opposite of the usual precedence.
+    /// The process environment. `.env` values are checked *first*, which is
+    /// the opposite of the usual precedence and deliberate: a `.env` in the
+    /// repo is the setting the repo means, and an inherited one is whatever
+    /// the terminal happened to be carrying.
     environ: *const std.process.Environ.Map,
 };
 
-/// Largest config we will read. A process-compose.yaml is a few KB; anything
-/// past this is a mistake, and refusing it beats allocating it.
+/// Largest config we will read. A devrun.yml is a few KB; anything past this
+/// is a mistake, and refusing it beats allocating it.
 const max_file_bytes = 4 << 20;
 
 /// Carries the human-readable reason a config was rejected. The message is
@@ -48,6 +54,10 @@ pub const Diagnostic = struct {
     }
 };
 
+/// What a service is waiting for. The file says `started`, `ready`, `done` or
+/// `ok`; `resolveCondition` turns those four words into these five states,
+/// because `ready` alone means two different things depending on how the
+/// service it points at defines readiness.
 pub const Condition = enum {
     process_started,
     process_completed,
@@ -91,9 +101,9 @@ pub const Dependency = struct {
 
 /// How a Worker is asked to stop, before the ladder escalates to SIGKILL.
 pub const Shutdown = struct {
-    /// Signal number, matching process-compose's `shutdown.signal`. Kept as a
-    /// number rather than an enum because that is what the file holds, and a
-    /// user writing `signal: 2` means 2 on this machine.
+    /// Signal number. The file names its signals (`SIGINT`), because a number
+    /// is not portable across platforms; this is what that name resolved to on
+    /// the machine doing the reading.
     signal: u8 = 15, // SIGTERM
     /// How long the Group has to exit on its own before it is killed.
     timeout_seconds: u32 = 10,
@@ -109,9 +119,10 @@ pub const Worker = struct {
     depends_on: []const Dependency = &.{},
     restart: Restart = .no,
     readiness_probe: ?Probe = null,
-    /// Substring that, once seen in this Worker's Archive, satisfies a
-    /// `process_log_ready` dependency. Without it that condition can never be
-    /// met, so `checkDependencies` refuses the pair.
+    /// Substring that, once seen in this Worker's Archive, makes this Worker
+    /// Ready. The other half of `readiness_probe`: a Worker has at most one of
+    /// the two, because `ready:` in the file holds exactly one of `http`,
+    /// `exec` or `log`.
     ready_log_line: ?[]const u8 = null,
     shutdown: Shutdown = .{},
 };
@@ -125,6 +136,11 @@ pub const Config = struct {
     arena: std.heap.ArenaAllocator,
     shell: Shell,
     workers: []const Worker,
+    /// Things worth saying that are not worth refusing over. A config that
+    /// loads with warnings is a config that runs; the caller prints these once
+    /// and carries on. Allocated from `arena`, so they live as long as the
+    /// Config does.
+    warnings: []const []const u8 = &.{},
 
     pub fn deinit(self: *Config) void {
         self.arena.deinit();
@@ -314,9 +330,9 @@ const Ctx = struct {
     /// identical everywhere — this is the error a user is most likely to hit.
     fn unsupported(self: Ctx, path: []const u8, key: []const u8) error{Invalid} {
         return self.fail(
-            "{s}: unsupported field \"{s}\". devrun reads a subset of " ++
-                "process-compose's schema and refuses fields it would otherwise " ++
-                "ignore, so that both tools read this file the same way.",
+            "{s}: unsupported field \"{s}\". devrun refuses a field it would " ++
+                "otherwise ignore, so that nothing in this file is in effect " ++
+                "except what it says.",
             .{ path, key },
         );
     }
@@ -377,8 +393,8 @@ fn isNameChar(c: u8) bool {
 /// Expands `${NAME}` and `$NAME` over raw text. Unset names become empty, which
 /// is what makes `HTTPS_PROXY=${TRACE_PROXY}` harmless when TRACE_PROXY is not
 /// set. Bash parameter expansion (`${VAR:-default}`, `${VAR#prefix}`, …) is
-/// rejected rather than passed through, because process-compose rejects it too
-/// and a config that works under one tool must work under the other.
+/// rejected rather than passed through: devrun is not a shell, and quietly
+/// expanding half of the syntax is worse than expanding none of it.
 fn expandEnv(ctx: Ctx, src: []const u8, env: *const Env) ![]const u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     try out.ensureTotalCapacity(ctx.arena, src.len);
@@ -405,9 +421,9 @@ fn expandEnv(ctx: Ctx, src: []const u8, env: *const Env) ![]const u8 {
             for (name) |c| {
                 if (!isNameChar(c)) {
                     return ctx.fail(
-                        "\"${{{s}}}\" uses shell parameter expansion, which " ++
-                            "process-compose rejects and devrun rejects too. Move the " ++
-                            "logic into a script and call that instead.",
+                        "\"${{{s}}}\" uses shell parameter expansion, which devrun " ++
+                            "does not implement. Move the logic into a script and " ++
+                            "call that instead.",
                         .{name},
                     );
                 }
@@ -434,14 +450,26 @@ fn expandEnv(ctx: Ctx, src: []const u8, env: *const Env) ![]const u8 {
 // ------------------------------------------------------------- yaml walking
 
 fn expectMap(ctx: Ctx, v: Yaml.Value, path: []const u8) !Yaml.Map {
+    // The vendored parser reads a flow mapping as nothing at all rather than
+    // failing on it, so this is the one place that silence can be turned back
+    // into a sentence. See `docs/adr/0008-devrun-yml.md`.
+    switch (v) {
+        .empty => return ctx.fail(
+            "{s}: expected a mapping and found nothing. A mapping written on one " ++
+                "line ({{a: b}}) is read as empty here — write it across lines instead.",
+            .{path},
+        ),
+        else => {},
+    }
     return v.asMap() orelse ctx.fail("{s}: expected a mapping", .{path});
 }
 
 fn expectScalar(ctx: Ctx, v: Yaml.Value, path: []const u8) ![]const u8 {
     return switch (v) {
         .scalar => |s| s,
-        // zig-yaml resolves bare `no`/`yes` to booleans; process-compose users
-        // write `restart: "no"` quoted, but an unquoted one must not crash.
+        // The parser never produces one today, but `restart: no` is a real
+        // value in this format and a YAML that resolved it to `false` must not
+        // reach a call site expecting text.
         .boolean => |b| if (b) "true" else "false",
         else => ctx.fail("{s}: expected a scalar", .{path}),
     };
@@ -457,10 +485,49 @@ fn expectU32(ctx: Ctx, v: Yaml.Value, path: []const u8) !u32 {
         ctx.fail("{s}: expected a whole number, got \"{s}\"", .{ path, s });
 }
 
-fn expectU16(ctx: Ctx, v: Yaml.Value, path: []const u8) !u16 {
-    const s = try expectScalar(ctx, v, path);
-    return std.fmt.parseInt(u16, s, 10) catch
-        ctx.fail("{s}: expected a port number, got \"{s}\"", .{ path, s });
+/// A duration in the units the CLI already takes: `5s`, `2m`, `1h`, or a bare
+/// number of seconds. Sub-second is refused rather than rounded, because every
+/// field that takes one is counted by the Probe in whole seconds, and silently
+/// turning `500ms` into either 0s or 1s is a config that does not do what it
+/// says.
+fn expectSeconds(ctx: Ctx, v: Yaml.Value, path: []const u8) !u32 {
+    const text = try expectScalar(ctx, v, path);
+    const ms = logs_mod.parseDuration(text) orelse return ctx.fail(
+        "{s}: expected a duration like 5s, 2m or 1h, got \"{s}\"",
+        .{ path, text },
+    );
+    if (ms % 1000 != 0) {
+        return ctx.fail("{s}: \"{s}\" is not a whole number of seconds", .{ path, text });
+    }
+    const seconds = ms / 1000;
+    if (seconds > std.math.maxInt(u32)) {
+        return ctx.fail("{s}: \"{s}\" is longer than devrun can wait", .{ path, text });
+    }
+    return @intCast(seconds);
+}
+
+/// One string or a list of them. `env_file: .env` is the common case and
+/// wrapping it in brackets to say so would be ceremony.
+fn scalarOrList(ctx: Ctx, v: Yaml.Value, path: []const u8) ![]const []const u8 {
+    switch (v) {
+        .scalar => |single| {
+            const out = try ctx.arena.alloc([]const u8, 1);
+            out[0] = single;
+            return out;
+        },
+        else => return stringList(ctx, v, path),
+    }
+}
+
+/// Folds an `env:` mapping into the Builder's, so `defaults` and a service's
+/// own env end up merged per variable with the service winning.
+fn mergeEnv(ctx: Ctx, b: *Builder, v: Yaml.Value, path: []const u8) !void {
+    const m = try expectMap(ctx, v, path);
+    for (m.keys(), m.values()) |key, value| {
+        if (key.len == 0) return ctx.fail("{s}: has a variable with no name", .{path});
+        const kp = try std.fmt.allocPrint(ctx.arena, "{s}.{s}", .{ path, key });
+        try b.env.put(ctx.arena, key, try expectScalar(ctx, value, kp));
+    }
 }
 
 fn stringList(ctx: Ctx, v: Yaml.Value, path: []const u8) ![]const []const u8 {
@@ -474,145 +541,380 @@ fn stringList(ctx: Ctx, v: Yaml.Value, path: []const u8) ![]const []const u8 {
     return out;
 }
 
+// ------------------------------------------------------------- mapping
+
 fn mapRoot(ctx: Ctx, doc: Yaml.Value, arena: *std.heap.ArenaAllocator) !Config {
     const root = try expectMap(ctx, doc, "config root");
 
     var shell = Shell{};
-    var workers: []const Worker = &.{};
-    var saw_processes = false;
+    var defaults: ?Yaml.Map = null;
+    var services: ?Yaml.Map = null;
 
     for (root.keys(), root.values()) |key, value| {
-        if (std.mem.eql(u8, key, "version")) {
-            // Accepted and ignored: it names process-compose's schema revision,
-            // and we already refuse anything we do not understand by field.
-        } else if (std.mem.eql(u8, key, "shell")) {
+        if (std.mem.eql(u8, key, "shell")) {
             shell = try mapShell(ctx, value);
-        } else if (std.mem.eql(u8, key, "processes")) {
-            workers = try mapWorkers(ctx, value);
-            saw_processes = true;
+        } else if (std.mem.eql(u8, key, "defaults")) {
+            defaults = try expectMap(ctx, value, "defaults");
+        } else if (std.mem.eql(u8, key, "services")) {
+            services = try expectMap(ctx, value, "services");
         } else {
             return ctx.unsupported("config root", key);
         }
     }
 
-    if (!saw_processes) return ctx.fail("config has no \"processes\" section", .{});
-    if (workers.len == 0) return ctx.fail("\"processes\" is empty", .{});
+    const svc = services orelse return ctx.fail("config has no \"services\" section", .{});
+    if (svc.count() == 0) return ctx.fail("\"services\" is empty", .{});
 
-    try checkDependencies(ctx, workers);
+    const workers = try ctx.arena.alloc(Worker, svc.count());
+    // `after` cannot be resolved while the services are still being read: what
+    // `ready` means for a service is decided by that service's own `ready:`
+    // block, which may appear later in the file. So the words are kept as
+    // written and resolved once every service is known.
+    const pending = try ctx.arena.alloc([]const RawDep, svc.count());
 
-    return .{ .arena = arena.*, .shell = shell, .workers = workers };
+    for (svc.keys(), svc.values(), 0..) |name, value, i| {
+        if (name.len == 0) return ctx.fail("services has an entry with no name", .{});
+        const parsed = try mapService(ctx, name, value, defaults);
+        workers[i] = parsed.worker;
+        pending[i] = parsed.after;
+    }
+
+    var warnings: std.ArrayListUnmanaged([]const u8) = .empty;
+    try resolveAfter(ctx, workers, pending, &warnings);
+    try checkAcyclic(ctx, workers);
+
+    return .{
+        .arena = arena.*,
+        .shell = shell,
+        .workers = workers,
+        .warnings = try warnings.toOwnedSlice(ctx.arena),
+    };
 }
 
+/// `shell: [bash, -c]`. A pair rather than two named keys, because the two
+/// halves are never useful apart and naming them separately invited
+/// `shell_command` sitting alone with no argument to go with it.
 fn mapShell(ctx: Ctx, v: Yaml.Value) !Shell {
-    const m = try expectMap(ctx, v, "shell");
-    var shell = Shell{};
+    const list = try expectList(ctx, v, "shell");
+    if (list.len != 2) {
+        return ctx.fail(
+            "shell: expected a command and its argument, like [bash, -c], got {d} item(s)",
+            .{list.len},
+        );
+    }
+    return .{
+        .command = try expectScalar(ctx, list[0], "shell[0]"),
+        .argument = try expectScalar(ctx, list[1], "shell[1]"),
+    };
+}
+
+/// One entry under `after`, before the config knows what it points at.
+const RawDep = struct {
+    /// The service being waited on.
+    name: []const u8,
+    /// The condition word exactly as written.
+    word: []const u8,
+    /// Where to point when the name or the word turns out to be wrong.
+    path: []const u8,
+};
+
+const ParsedService = struct {
+    worker: Worker,
+    after: []const RawDep,
+};
+
+/// Everything a service is while it is still being read.
+///
+/// `env` stays a map here rather than the `KEY=VALUE` list the Supervisor
+/// wants, because it is the one key where `defaults` merges instead of being
+/// replaced, and merging a list of glued strings means splitting them again.
+const Builder = struct {
+    worker: Worker,
+    after: []const RawDep = &.{},
+    saw_run: bool = false,
+    env: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
+
+    fn flattenEnv(self: *Builder, ctx: Ctx) ![]const []const u8 {
+        const out = try ctx.arena.alloc([]const u8, self.env.count());
+        for (self.env.keys(), self.env.values(), 0..) |k, v, i| {
+            out[i] = try std.fmt.allocPrint(ctx.arena, "{s}={s}", .{ k, v });
+        }
+        return out;
+    }
+};
+
+/// A service is either a string, which is its command and nothing else, or a
+/// map. The two are different YAML types rather than two shapes of one, so
+/// there is nothing to guess and the error for a third shape can say so.
+fn mapService(ctx: Ctx, name: []const u8, v: Yaml.Value, defaults: ?Yaml.Map) !ParsedService {
+    const path = try std.fmt.allocPrint(ctx.arena, "services.{s}", .{name});
+
+    var b = Builder{ .worker = .{ .name = name, .command = "" } };
+    // Defaults first so that anything the service names overwrites them. There
+    // is no merging at depth: a service that writes `stop:` replaces the whole
+    // block rather than the fields it happened to mention. `env` is the one
+    // exception, and it is a map for exactly that reason.
+    //
+    // Applied before the shape is known, so that writing a service on one line
+    // is a shorter way to say the same thing rather than a quieter way to say
+    // something else.
+    if (defaults) |d| try applyKeys(ctx, &b, d, "defaults", true);
+
+    switch (v) {
+        .scalar => |command| {
+            if (command.len == 0) return ctx.fail("{s}: the command is empty", .{path});
+            b.worker.command = command;
+        },
+        .map => {
+            try applyKeys(ctx, &b, try expectMap(ctx, v, path), path, false);
+            if (!b.saw_run) return ctx.fail("{s}: missing \"run\"", .{path});
+            if (b.worker.command.len == 0) return ctx.fail("{s}.run is empty", .{path});
+        },
+        else => return ctx.fail(
+            "{s}: expected a command, or a mapping of settings",
+            .{path},
+        ),
+    }
+
+    b.worker.environment = try b.flattenEnv(ctx);
+    return .{ .worker = b.worker, .after = b.after };
+}
+
+fn applyKeys(ctx: Ctx, b: *Builder, m: Yaml.Map, path: []const u8, is_defaults: bool) !void {
     for (m.keys(), m.values()) |key, value| {
-        if (std.mem.eql(u8, key, "shell_command")) {
-            shell.command = try expectScalar(ctx, value, "shell.shell_command");
-        } else if (std.mem.eql(u8, key, "shell_argument")) {
-            shell.argument = try expectScalar(ctx, value, "shell.shell_argument");
+        const kp = try std.fmt.allocPrint(ctx.arena, "{s}.{s}", .{ path, key });
+        if (std.mem.eql(u8, key, "run")) {
+            if (is_defaults) return ctx.fail(
+                "defaults.run: every service needs its own command, so \"run\" cannot be a default",
+                .{},
+            );
+            b.worker.command = try expectScalar(ctx, value, kp);
+            b.saw_run = true;
+        } else if (std.mem.eql(u8, key, "description")) {
+            b.worker.description = try expectScalar(ctx, value, kp);
+        } else if (std.mem.eql(u8, key, "dir")) {
+            b.worker.working_dir = try expectScalar(ctx, value, kp);
+        } else if (std.mem.eql(u8, key, "env_file")) {
+            b.worker.dotenv = try scalarOrList(ctx, value, kp);
+        } else if (std.mem.eql(u8, key, "env")) {
+            try mergeEnv(ctx, b, value, kp);
+        } else if (std.mem.eql(u8, key, "after")) {
+            if (is_defaults) return ctx.fail(
+                "defaults.after: a dependency belongs to one service, so \"after\" cannot be a default",
+                .{},
+            );
+            b.after = try mapAfter(ctx, value, kp);
+        } else if (std.mem.eql(u8, key, "restart")) {
+            b.worker.restart = try mapRestart(ctx, value, kp);
+        } else if (std.mem.eql(u8, key, "ready")) {
+            // Cleared first so a service's own `ready:` replaces the one it
+            // inherited rather than half of it: the two fields are the two
+            // shapes readiness comes in, and holding both would be a state no
+            // file can express.
+            b.worker.readiness_probe = null;
+            b.worker.ready_log_line = null;
+            try mapReady(ctx, b, value, kp);
+        } else if (std.mem.eql(u8, key, "stop")) {
+            b.worker.shutdown = try mapStop(ctx, value, kp);
         } else {
-            return ctx.unsupported("shell", key);
+            return ctx.unsupported(path, key);
         }
     }
-    return shell;
 }
 
-fn mapWorkers(ctx: Ctx, v: Yaml.Value) ![]const Worker {
-    const m = try expectMap(ctx, v, "processes");
-    const out = try ctx.arena.alloc(Worker, m.count());
-    for (m.keys(), m.values(), 0..) |name, value, i| {
-        out[i] = try mapWorker(ctx, name, value);
+fn mapRestart(ctx: Ctx, v: Yaml.Value, path: []const u8) !Restart {
+    const text = try expectScalar(ctx, v, path);
+    return std.meta.stringToEnum(Restart, text) orelse ctx.fail(
+        "{s}: unknown policy \"{s}\" (expected no, always, on_failure or exit_on_failure)",
+        .{ path, text },
+    );
+}
+
+/// `after: [db, migrate]` waits for both to be Ready. `after: {db: ready}`
+/// says which state to wait for. A list and a map are different YAML types, so
+/// the two forms cannot be confused for one another.
+fn mapAfter(ctx: Ctx, v: Yaml.Value, path: []const u8) ![]const RawDep {
+    switch (v) {
+        .list => |list| {
+            const out = try ctx.arena.alloc(RawDep, list.len);
+            for (list, 0..) |item, i| {
+                const ip = try std.fmt.allocPrint(ctx.arena, "{s}[{d}]", .{ path, i });
+                out[i] = .{
+                    .name = try expectScalar(ctx, item, ip),
+                    .word = "ready",
+                    .path = ip,
+                };
+            }
+            return out;
+        },
+        .map => |m| {
+            const out = try ctx.arena.alloc(RawDep, m.count());
+            for (m.keys(), m.values(), 0..) |dep_name, value, i| {
+                const dp = try std.fmt.allocPrint(ctx.arena, "{s}.{s}", .{ path, dep_name });
+                out[i] = .{
+                    .name = dep_name,
+                    .word = try expectScalar(ctx, value, dp),
+                    .path = dp,
+                };
+            }
+            return out;
+        },
+        // `.empty` lands here when someone writes `after: {db: ready}`, which
+        // the vendored parser reads as nothing rather than refusing.
+        else => return ctx.fail(
+            "{s}: expected a list of service names, or a mapping of name to " ++
+                "condition written across lines — a mapping on one line " ++
+                "({{db: ready}}) is read as empty here.",
+            .{path},
+        ),
     }
-    return out;
 }
 
-fn mapWorker(ctx: Ctx, name: []const u8, v: Yaml.Value) !Worker {
-    const path = try std.fmt.allocPrint(ctx.arena, "processes.{s}", .{name});
+/// `ready:` holds exactly one of `http`, `exec` or `log`, plus the timing that
+/// applies to a probe. The one-of is checked here rather than left to the
+/// Supervisor, because two of them is a file whose author believed something
+/// that is not true about their own service.
+fn mapReady(ctx: Ctx, b: *Builder, v: Yaml.Value, path: []const u8) !void {
     const m = try expectMap(ctx, v, path);
 
-    var w = Worker{ .name = name, .command = "" };
-    var saw_command = false;
+    var probe = Probe{ .target = undefined };
+    var target: ?@FieldType(Probe, "target") = null;
+    var log_line: ?[]const u8 = null;
+    // The first timing key seen, so that pairing one with `log` can name it.
+    var timing: ?[]const u8 = null;
 
     for (m.keys(), m.values()) |key, value| {
         const kp = try std.fmt.allocPrint(ctx.arena, "{s}.{s}", .{ path, key });
-        if (std.mem.eql(u8, key, "command")) {
-            w.command = try expectScalar(ctx, value, kp);
-            saw_command = true;
-        } else if (std.mem.eql(u8, key, "description")) {
-            w.description = try expectScalar(ctx, value, kp);
-        } else if (std.mem.eql(u8, key, "working_dir")) {
-            w.working_dir = try expectScalar(ctx, value, kp);
-        } else if (std.mem.eql(u8, key, "dotenv")) {
-            w.dotenv = try stringList(ctx, value, kp);
-        } else if (std.mem.eql(u8, key, "environment")) {
-            w.environment = try stringList(ctx, value, kp);
-        } else if (std.mem.eql(u8, key, "depends_on")) {
-            w.depends_on = try mapDependsOn(ctx, value, kp);
-        } else if (std.mem.eql(u8, key, "availability")) {
-            w.restart = try mapAvailability(ctx, value, kp);
-        } else if (std.mem.eql(u8, key, "readiness_probe")) {
-            w.readiness_probe = try mapProbe(ctx, value, kp);
-        } else if (std.mem.eql(u8, key, "ready_log_line")) {
-            w.ready_log_line = try expectScalar(ctx, value, kp);
-        } else if (std.mem.eql(u8, key, "shutdown")) {
-            w.shutdown = try mapShutdown(ctx, value, kp);
+        if (std.mem.eql(u8, key, "http")) {
+            try onlyOne(ctx, path, target != null or log_line != null);
+            target = .{ .http_get = try mapUrl(ctx, value, kp) };
+        } else if (std.mem.eql(u8, key, "exec")) {
+            try onlyOne(ctx, path, target != null or log_line != null);
+            target = .{ .exec = try expectScalar(ctx, value, kp) };
+        } else if (std.mem.eql(u8, key, "log")) {
+            try onlyOne(ctx, path, target != null or log_line != null);
+            log_line = try expectScalar(ctx, value, kp);
+        } else if (std.mem.eql(u8, key, "delay")) {
+            probe.initial_delay_seconds = try expectSeconds(ctx, value, kp);
+            timing = timing orelse key;
+        } else if (std.mem.eql(u8, key, "every")) {
+            probe.period_seconds = try expectSeconds(ctx, value, kp);
+            timing = timing orelse key;
+        } else if (std.mem.eql(u8, key, "timeout")) {
+            probe.timeout_seconds = try expectSeconds(ctx, value, kp);
+            timing = timing orelse key;
+        } else if (std.mem.eql(u8, key, "passes")) {
+            probe.success_threshold = try expectU32(ctx, value, kp);
+            timing = timing orelse key;
+        } else if (std.mem.eql(u8, key, "fails")) {
+            probe.failure_threshold = try expectU32(ctx, value, kp);
+            timing = timing orelse key;
         } else {
             return ctx.unsupported(path, key);
         }
     }
 
-    if (!saw_command) return ctx.fail("{s}: missing \"command\"", .{path});
-    if (w.command.len == 0) return ctx.fail("{s}.command is empty", .{path});
-    return w;
-}
-
-fn mapDependsOn(ctx: Ctx, v: Yaml.Value, path: []const u8) ![]const Dependency {
-    const m = try expectMap(ctx, v, path);
-    const out = try ctx.arena.alloc(Dependency, m.count());
-    for (m.keys(), m.values(), 0..) |dep_name, value, i| {
-        const dp = try std.fmt.allocPrint(ctx.arena, "{s}.{s}", .{ path, dep_name });
-        const dm = try expectMap(ctx, value, dp);
-        var condition: Condition = .process_started; // process-compose's default
-        for (dm.keys(), dm.values()) |key, cv| {
-            if (!std.mem.eql(u8, key, "condition")) return ctx.unsupported(dp, key);
-            const text = try expectScalar(ctx, cv, dp);
-            condition = std.meta.stringToEnum(Condition, text) orelse
-                return ctx.fail("{s}.condition: unknown condition \"{s}\"", .{ dp, text });
-        }
-        out[i] = .{ .name = dep_name, .condition = condition };
+    if (log_line) |line| {
+        if (line.len == 0) return ctx.fail("{s}.log is empty", .{path});
+        // Refused rather than ignored: a log line is matched as the Archive is
+        // written, so there is no period to set and no attempt to time out.
+        if (timing) |t| return ctx.fail(
+            "{s}: \"{s}\" has no meaning next to \"log\", which is matched as the " ++
+                "output arrives rather than polled",
+            .{ path, t },
+        );
+        b.worker.ready_log_line = line;
+        return;
     }
-    return out;
+
+    probe.target = target orelse return ctx.fail(
+        "{s}: needs one of \"http\", \"exec\" or \"log\"",
+        .{path},
+    );
+    if (probe.period_seconds == 0) return ctx.fail("{s}.every must be at least 1s", .{path});
+    if (probe.timeout_seconds == 0) return ctx.fail("{s}.timeout must be at least 1s", .{path});
+    if (probe.success_threshold == 0) return ctx.fail("{s}.passes must be at least 1", .{path});
+    if (probe.failure_threshold == 0) return ctx.fail("{s}.fails must be at least 1", .{path});
+    b.worker.readiness_probe = probe;
 }
 
-fn mapAvailability(ctx: Ctx, v: Yaml.Value, path: []const u8) !Restart {
-    const m = try expectMap(ctx, v, path);
-    var restart: Restart = .no;
-    for (m.keys(), m.values()) |key, value| {
-        if (!std.mem.eql(u8, key, "restart")) return ctx.unsupported(path, key);
-        const text = try expectScalar(ctx, value, path);
-        restart = std.meta.stringToEnum(Restart, text) orelse
-            return ctx.fail(
-                "{s}.restart: unknown policy \"{s}\" (expected no, always, on_failure, exit_on_failure)",
-                .{ path, text },
-            );
+fn onlyOne(ctx: Ctx, path: []const u8, already: bool) !void {
+    if (already) return ctx.fail(
+        "{s}: give exactly one of \"http\", \"exec\" or \"log\"",
+        .{path},
+    );
+}
+
+/// `http://127.0.0.1:3000/health`, split into what the Probe wants.
+///
+/// Both refusals below are the Probe's limits rather than the format's, and
+/// both are caught here so they land on the terminal that typed `devrun up`
+/// instead of becoming a service that never turns Ready.
+fn mapUrl(ctx: Ctx, v: Yaml.Value, path: []const u8) !HttpGet {
+    const text = try expectScalar(ctx, v, path);
+
+    if (std.mem.startsWith(u8, text, "https://")) return ctx.fail(
+        "{s}: https is not supported. The probe speaks plain HTTP, and probing " ++
+            "an https port over http would report a service ready that is not.",
+        .{path},
+    );
+    if (!std.mem.startsWith(u8, text, "http://")) return ctx.fail(
+        "{s}: expected a URL like http://127.0.0.1:3000/health, got \"{s}\"",
+        .{ path, text },
+    );
+
+    const rest = text["http://".len..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
+    const authority = rest[0..slash];
+    const url_path = if (slash == rest.len) "/" else rest[slash..];
+
+    var host = authority;
+    var port: u16 = 80;
+    if (std.mem.lastIndexOfScalar(u8, authority, ':')) |colon| {
+        host = authority[0..colon];
+        const port_text = authority[colon + 1 ..];
+        port = std.fmt.parseInt(u16, port_text, 10) catch return ctx.fail(
+            "{s}: \"{s}\" is not a port number",
+            .{ path, port_text },
+        );
+        if (port == 0) return ctx.fail("{s}: port 0 is not a port to probe", .{path});
     }
-    return restart;
+    if (host.len == 0) return ctx.fail("{s}: no host in \"{s}\"", .{ path, text });
+    if (!isIp4OrLocalhost(host)) return ctx.fail(
+        "{s}: the host must be an IPv4 literal or \"localhost\", not \"{s}\". The " ++
+            "probe does not resolve names, because one that waits on DNS is " ++
+            "measuring the resolver as much as the service.",
+        .{ path, host },
+    );
+
+    return .{ .host = host, .scheme = "http", .path = url_path, .port = port };
 }
 
-fn mapShutdown(ctx: Ctx, v: Yaml.Value, path: []const u8) !Shutdown {
+/// Mirrors what `probe.parseIp4` will accept. Kept in step with it deliberately:
+/// the point of checking here is that the two agree, so a URL this accepts is a
+/// URL that will probe.
+fn isIp4OrLocalhost(host: []const u8) bool {
+    if (std.mem.eql(u8, host, "localhost")) return true;
+    var seen: usize = 0;
+    var it = std.mem.splitScalar(u8, host, '.');
+    while (it.next()) |part| {
+        seen += 1;
+        if (seen > 4) return false;
+        if (part.len == 0 or part.len > 3) return false;
+        _ = std.fmt.parseInt(u8, part, 10) catch return false;
+    }
+    return seen == 4;
+}
+
+fn mapStop(ctx: Ctx, v: Yaml.Value, path: []const u8) !Shutdown {
     const m = try expectMap(ctx, v, path);
     var out = Shutdown{};
     for (m.keys(), m.values()) |key, value| {
         const kp = try std.fmt.allocPrint(ctx.arena, "{s}.{s}", .{ path, key });
         if (std.mem.eql(u8, key, "signal")) {
-            const n = try expectU32(ctx, value, kp);
-            if (n == 0 or n > 31) {
-                return ctx.fail("{s}: signal {d} is not a signal number", .{ kp, n });
-            }
-            out.signal = @intCast(n);
-        } else if (std.mem.eql(u8, key, "timeout_seconds")) {
-            out.timeout_seconds = try expectU32(ctx, value, kp);
+            out.signal = try mapSignal(ctx, value, kp);
+        } else if (std.mem.eql(u8, key, "grace")) {
+            out.timeout_seconds = try expectSeconds(ctx, value, kp);
         } else {
             return ctx.unsupported(path, key);
         }
@@ -620,111 +922,121 @@ fn mapShutdown(ctx: Ctx, v: Yaml.Value, path: []const u8) !Shutdown {
     return out;
 }
 
-fn mapProbe(ctx: Ctx, v: Yaml.Value, path: []const u8) !Probe {
-    const m = try expectMap(ctx, v, path);
-    var target: ?@FieldType(Probe, "target") = null;
-    var probe = Probe{ .target = undefined };
+/// Signals are named rather than numbered. A number is what the kernel wants,
+/// but it is not portable across the platforms devrun means to run on — SIGUSR1
+/// is 10 here and 30 on a Mac — so a file holding `10` would mean two different
+/// things on two machines while looking identical.
+const signals = [_]struct { name: []const u8, number: u8 }{
+    .{ .name = "SIGHUP", .number = @intFromEnum(os.SIG.HUP) },
+    .{ .name = "SIGINT", .number = @intFromEnum(os.SIG.INT) },
+    .{ .name = "SIGQUIT", .number = @intFromEnum(os.SIG.QUIT) },
+    .{ .name = "SIGABRT", .number = @intFromEnum(os.SIG.ABRT) },
+    .{ .name = "SIGKILL", .number = @intFromEnum(os.SIG.KILL) },
+    .{ .name = "SIGUSR1", .number = @intFromEnum(os.SIG.USR1) },
+    .{ .name = "SIGUSR2", .number = @intFromEnum(os.SIG.USR2) },
+    .{ .name = "SIGTERM", .number = @intFromEnum(os.SIG.TERM) },
+};
 
-    for (m.keys(), m.values()) |key, value| {
-        const kp = try std.fmt.allocPrint(ctx.arena, "{s}.{s}", .{ path, key });
-        if (std.mem.eql(u8, key, "exec")) {
-            if (target != null) return ctx.fail("{s}: has both \"exec\" and \"http_get\"", .{path});
-            target = .{ .exec = try mapExecProbe(ctx, value, kp) };
-        } else if (std.mem.eql(u8, key, "http_get")) {
-            if (target != null) return ctx.fail("{s}: has both \"exec\" and \"http_get\"", .{path});
-            target = .{ .http_get = try mapHttpGet(ctx, value, kp) };
-        } else if (std.mem.eql(u8, key, "initial_delay_seconds")) {
-            probe.initial_delay_seconds = try expectU32(ctx, value, kp);
-        } else if (std.mem.eql(u8, key, "period_seconds")) {
-            probe.period_seconds = try expectU32(ctx, value, kp);
-        } else if (std.mem.eql(u8, key, "timeout_seconds")) {
-            probe.timeout_seconds = try expectU32(ctx, value, kp);
-        } else if (std.mem.eql(u8, key, "success_threshold")) {
-            probe.success_threshold = try expectU32(ctx, value, kp);
-        } else if (std.mem.eql(u8, key, "failure_threshold")) {
-            probe.failure_threshold = try expectU32(ctx, value, kp);
-        } else {
-            return ctx.unsupported(path, key);
-        }
+/// The name a signal number came from, for printing a config back. Falls back
+/// to the number, because a signal devrun cannot name is still a signal that
+/// will be sent and hiding it would be worse than showing a bare integer.
+pub fn signalName(number: u8) []const u8 {
+    for (signals) |s| {
+        if (s.number == number) return s.name;
     }
-
-    probe.target = target orelse
-        return ctx.fail("{s}: needs either \"exec\" or \"http_get\"", .{path});
-    if (probe.period_seconds == 0) return ctx.fail("{s}.period_seconds must be at least 1", .{path});
-    return probe;
+    return "signal";
 }
 
-fn mapExecProbe(ctx: Ctx, v: Yaml.Value, path: []const u8) ![]const u8 {
-    const m = try expectMap(ctx, v, path);
-    var command: ?[]const u8 = null;
-    for (m.keys(), m.values()) |key, value| {
-        if (!std.mem.eql(u8, key, "command")) return ctx.unsupported(path, key);
-        command = try expectScalar(ctx, value, path);
-    }
-    return command orelse ctx.fail("{s}: missing \"command\"", .{path});
+/// The word a Condition is written as. The inverse of `resolveCondition`, and
+/// lossy in the one place that inverse cannot be exact: two states are reached
+/// by the same word, because what `ready` means is decided by the service being
+/// waited on rather than by the waiting.
+pub fn conditionWord(c: Condition) []const u8 {
+    return switch (c) {
+        .process_started => "started",
+        .process_completed => "done",
+        .process_completed_successfully => "ok",
+        .process_healthy, .process_log_ready => "ready",
+    };
 }
 
-fn mapHttpGet(ctx: Ctx, v: Yaml.Value, path: []const u8) !HttpGet {
-    const m = try expectMap(ctx, v, path);
-    var get = HttpGet{ .port = 0 };
-    var saw_port = false;
-    for (m.keys(), m.values()) |key, value| {
-        const kp = try std.fmt.allocPrint(ctx.arena, "{s}.{s}", .{ path, key });
-        if (std.mem.eql(u8, key, "host")) {
-            get.host = try expectScalar(ctx, value, kp);
-        } else if (std.mem.eql(u8, key, "scheme")) {
-            get.scheme = try expectScalar(ctx, value, kp);
-        } else if (std.mem.eql(u8, key, "path")) {
-            get.path = try expectScalar(ctx, value, kp);
-        } else if (std.mem.eql(u8, key, "port")) {
-            get.port = try expectU16(ctx, value, kp);
-            saw_port = true;
-        } else {
-            return ctx.unsupported(path, key);
-        }
+fn mapSignal(ctx: Ctx, v: Yaml.Value, path: []const u8) !u8 {
+    const text = try expectScalar(ctx, v, path);
+    for (signals) |s| {
+        if (std.mem.eql(u8, s.name, text)) return s.number;
     }
-    if (!saw_port) return ctx.fail("{s}: missing \"port\"", .{path});
-    return get;
+
+    var known: std.Io.Writer.Allocating = .init(ctx.arena);
+    for (signals, 0..) |s, i| {
+        if (i > 0) known.writer.writeAll(", ") catch {};
+        known.writer.writeAll(s.name) catch {};
+    }
+    return ctx.fail(
+        "{s}: unknown signal \"{s}\" (expected one of {s})",
+        .{ path, text, known.written() },
+    );
 }
 
-/// Everything about the dependency graph that can be decided from the text
-/// alone. All of it is caught here rather than at startup, so a broken graph
-/// fails before anything is spawned rather than halfway through bringing a
-/// Session up.
-fn checkDependencies(ctx: Ctx, workers: []const Worker) !void {
-    for (workers) |w| {
-        for (w.depends_on) |dep| {
+/// Resolves every `after` entry now that every service is known, and is the
+/// only place a condition word becomes a Condition.
+fn resolveAfter(
+    ctx: Ctx,
+    workers: []Worker,
+    pending: []const []const RawDep,
+    warnings: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    for (workers, pending, 0..) |*w, raw, self_index| {
+        const out = try ctx.arena.alloc(Dependency, raw.len);
+        for (raw, 0..) |dep, i| {
             const target = indexOf(workers, dep.name) orelse return ctx.fail(
-                "processes.{s}.depends_on: \"{s}\" is not a process in this config",
-                .{ w.name, dep.name },
+                "{s}: \"{s}\" is not a service in this config",
+                .{ dep.path, dep.name },
             );
-            if (std.mem.eql(u8, dep.name, w.name)) {
-                return ctx.fail("processes.{s} depends on itself", .{w.name});
+            if (target == self_index) {
+                return ctx.fail("services.{s} waits on itself", .{w.name});
             }
-            // A condition the target can never reach would stall the Session
-            // with no error, which is the failure mode this project exists to
-            // avoid. Both of these are cheap to check and impossible to debug
-            // from the outside.
-            switch (dep.condition) {
-                .process_healthy => if (workers[target].readiness_probe == null) {
-                    return ctx.fail(
-                        "processes.{s}.depends_on.{s}: waits for process_healthy, but " ++
-                            "\"{s}\" has no readiness_probe, so it can never become healthy",
-                        .{ w.name, dep.name, dep.name },
-                    );
-                },
-                .process_log_ready => if (workers[target].ready_log_line == null) {
-                    return ctx.fail(
-                        "processes.{s}.depends_on.{s}: waits for process_log_ready, but " ++
-                            "\"{s}\" has no ready_log_line, so it can never be log-ready",
-                        .{ w.name, dep.name, dep.name },
-                    );
-                },
-                else => {},
-            }
+            out[i] = .{
+                .name = dep.name,
+                .condition = try resolveCondition(ctx, dep, workers[target], w.name, warnings),
+            };
         }
+        w.depends_on = out;
     }
-    try checkAcyclic(ctx, workers);
+}
+
+/// The four words a file uses, onto the states the Supervisor tracks.
+///
+/// `ready` is the only one that needs to look at what it points at. Every
+/// service has a Ready state; what reaches it is whatever that service's own
+/// `ready:` block says, and a service without one is Ready as soon as it has
+/// started. That is said out loud as a warning rather than accepted in silence,
+/// because "waits for the database" and "waits for the database's pid" are not
+/// the same promise and only one of them is being kept.
+fn resolveCondition(
+    ctx: Ctx,
+    dep: RawDep,
+    target: Worker,
+    waiter: []const u8,
+    warnings: *std.ArrayListUnmanaged([]const u8),
+) !Condition {
+    if (std.mem.eql(u8, dep.word, "started")) return .process_started;
+    if (std.mem.eql(u8, dep.word, "done")) return .process_completed;
+    if (std.mem.eql(u8, dep.word, "ok")) return .process_completed_successfully;
+    if (!std.mem.eql(u8, dep.word, "ready")) return ctx.fail(
+        "{s}: unknown condition \"{s}\" (expected started, ready, done or ok)",
+        .{ dep.path, dep.word },
+    );
+
+    if (target.readiness_probe != null) return .process_healthy;
+    if (target.ready_log_line != null) return .process_log_ready;
+
+    try warnings.append(ctx.arena, try std.fmt.allocPrint(
+        ctx.arena,
+        "\"{s}\" waits for \"{s}\" to be ready, but \"{s}\" has no \"ready:\" block, " ++
+            "so it will only wait for it to start.",
+        .{ waiter, dep.name, dep.name },
+    ));
+    return .process_started;
 }
 
 fn indexOf(workers: []const Worker, name: []const u8) ?usize {
@@ -900,43 +1212,43 @@ test "adhoc builds a Config the Supervisor cannot tell from a parsed one" {
     try testing.expect(cfg.workers[0].command.ptr != @as([*]const u8, "pnpm run dev"));
 }
 
-test "parses the athena config shape" {
+test "parses a whole config, defaults and all" {
     const src =
-        \\version: "0.5"
-        \\shell:
-        \\  shell_command: bash
-        \\  shell_argument: "-c"
-        \\processes:
-        \\  wait-postgres:
-        \\    description: "wait for Postgres"
-        \\    dotenv: [".env"]
-        \\    command: "bash scripts/wait-postgres.sh"
-        \\    availability:
-        \\      restart: "no"
-        \\  go:
-        \\    description: "Go orchestrator API :8080"
-        \\    command: "go run ."
-        \\    working_dir: "."
-        \\    depends_on:
-        \\      wait-postgres:
-        \\        condition: process_completed_successfully
-        \\    readiness_probe:
-        \\      exec:
-        \\        command: "exec 3<>/dev/tcp/127.0.0.1/8080"
-        \\      initial_delay_seconds: 3
-        \\      period_seconds: 3
-        \\      timeout_seconds: 2
-        \\      failure_threshold: 40
-        \\  parser:
-        \\    command: "uv run uvicorn app.main:app"
-        \\    working_dir: "services/parser-service"
-        \\    readiness_probe:
-        \\      http_get:
-        \\        host: 127.0.0.1
-        \\        scheme: http
-        \\        path: "/healthz"
-        \\        port: 8000
-        \\      failure_threshold: 60
+        \\shell: [bash, "-c"]
+        \\defaults:
+        \\  env_file: ".env"
+        \\  stop:
+        \\    signal: SIGTERM
+        \\    grace: 10s
+        \\services:
+        \\  tailwind: "pnpm tailwindcss -w"
+        \\  db:
+        \\    run: "docker compose up postgres"
+        \\    ready:
+        \\      log: "database system is ready to accept connections"
+        \\  migrate:
+        \\    run: "pnpm drizzle-kit migrate"
+        \\    dir: "./api"
+        \\    after: [db]
+        \\  api:
+        \\    description: "REST API"
+        \\    run: "pnpm dev"
+        \\    dir: "./api"
+        \\    env_file: [".env", ".env.local"]
+        \\    env:
+        \\      PORT: "3000"
+        \\    after:
+        \\      migrate: ok
+        \\    restart: on_failure
+        \\    ready:
+        \\      http: "http://127.0.0.1:3000/health"
+        \\      delay: 2s
+        \\      every: 5s
+        \\      timeout: 1s
+        \\      fails: 40
+        \\    stop:
+        \\      signal: SIGINT
+        \\      grace: 5s
         \\
     ;
     var cfg = try loadForTest(src, &.{}, null);
@@ -944,45 +1256,107 @@ test "parses the athena config shape" {
 
     try testing.expectEqualStrings("bash", cfg.shell.command);
     try testing.expectEqualStrings("-c", cfg.shell.argument);
-    try testing.expectEqual(@as(usize, 3), cfg.workers.len);
+    try testing.expectEqual(@as(usize, 4), cfg.workers.len);
+    try testing.expectEqual(@as(usize, 0), cfg.warnings.len);
 
-    const gate = cfg.workers[cfg.find("wait-postgres").?];
-    try testing.expectEqual(Restart.no, gate.restart);
-    try testing.expectEqualStrings(".env", gate.dotenv[0]);
+    // A service written as a string is a command and nothing else, but it
+    // still picks up `defaults` — the short form is a shorter way to say the
+    // same thing, not a quieter way to say something else.
+    const tailwind = cfg.workers[cfg.find("tailwind").?];
+    try testing.expectEqualStrings("pnpm tailwindcss -w", tailwind.command);
+    try testing.expectEqual(@as(usize, 0), tailwind.depends_on.len);
+    try testing.expectEqualStrings(".env", tailwind.dotenv[0]);
+    try testing.expectEqual(@as(u32, 10), tailwind.shutdown.timeout_seconds);
 
-    const go = cfg.workers[cfg.find("go").?];
-    try testing.expectEqual(@as(usize, 1), go.depends_on.len);
-    try testing.expectEqualStrings("wait-postgres", go.depends_on[0].name);
-    try testing.expectEqual(Condition.process_completed_successfully, go.depends_on[0].condition);
+    const db = cfg.workers[cfg.find("db").?];
     try testing.expectEqualStrings(
-        "exec 3<>/dev/tcp/127.0.0.1/8080",
-        go.readiness_probe.?.target.exec,
+        "database system is ready to accept connections",
+        db.ready_log_line.?,
     );
-    try testing.expectEqual(@as(u32, 40), go.readiness_probe.?.failure_threshold);
-    // Not set in the file, so process-compose's default must apply.
-    try testing.expectEqual(@as(u32, 1), go.readiness_probe.?.success_threshold);
+    try testing.expect(db.readiness_probe == null);
+    // From `defaults`, which nothing on `db` overrode.
+    try testing.expectEqualStrings(".env", db.dotenv[0]);
+    try testing.expectEqual(@as(u8, 15), db.shutdown.signal);
+    try testing.expectEqual(@as(u32, 10), db.shutdown.timeout_seconds);
 
-    const parser = cfg.workers[cfg.find("parser").?];
-    const http = parser.readiness_probe.?.target.http_get;
-    try testing.expectEqual(@as(u16, 8000), http.port);
-    try testing.expectEqualStrings("/healthz", http.path);
-    // Unset timing fields fall back to process-compose's defaults, not zero.
-    try testing.expectEqual(@as(u32, 10), parser.readiness_probe.?.period_seconds);
-    try testing.expectEqual(@as(u32, 1), parser.readiness_probe.?.timeout_seconds);
-    // Omitted availability means "no", which is process-compose's default.
-    try testing.expectEqual(Restart.no, parser.restart);
+    // A list under `after` means Ready, and db defines Ready with a log line.
+    const migrate = cfg.workers[cfg.find("migrate").?];
+    try testing.expectEqual(@as(usize, 1), migrate.depends_on.len);
+    try testing.expectEqualStrings("db", migrate.depends_on[0].name);
+    try testing.expectEqual(Condition.process_log_ready, migrate.depends_on[0].condition);
+
+    const api = cfg.workers[cfg.find("api").?];
+    try testing.expectEqual(Condition.process_completed_successfully, api.depends_on[0].condition);
+    try testing.expectEqual(Restart.on_failure, api.restart);
+    try testing.expectEqualStrings("PORT=3000", api.environment[0]);
+    // `env_file` replaces what defaults set rather than appending to it.
+    try testing.expectEqual(@as(usize, 2), api.dotenv.len);
+    try testing.expectEqualStrings(".env.local", api.dotenv[1]);
+    // As does `stop`, whole block at a time.
+    try testing.expectEqual(@as(u8, 2), api.shutdown.signal);
+    try testing.expectEqual(@as(u32, 5), api.shutdown.timeout_seconds);
+
+    const http = api.readiness_probe.?.target.http_get;
+    try testing.expectEqualStrings("127.0.0.1", http.host);
+    try testing.expectEqual(@as(u16, 3000), http.port);
+    try testing.expectEqualStrings("/health", http.path);
+    try testing.expectEqual(@as(u32, 2), api.readiness_probe.?.initial_delay_seconds);
+    try testing.expectEqual(@as(u32, 5), api.readiness_probe.?.period_seconds);
+    try testing.expectEqual(@as(u32, 40), api.readiness_probe.?.failure_threshold);
+    // Not set in the file, so the default must apply rather than zero.
+    try testing.expectEqual(@as(u32, 1), api.readiness_probe.?.success_threshold);
+}
+
+test "env merges with defaults per variable, everything else replaces" {
+    const src =
+        \\defaults:
+        \\  env:
+        \\    LOG_LEVEL: "info"
+        \\    REGION: "local"
+        \\services:
+        \\  api:
+        \\    run: "pnpm dev"
+        \\    env:
+        \\      LOG_LEVEL: "debug"
+        \\      PORT: "3000"
+        \\
+    ;
+    var cfg = try loadForTest(src, &.{}, null);
+    defer cfg.deinit();
+
+    const env = cfg.workers[0].environment;
+    try testing.expectEqual(@as(usize, 3), env.len);
+    // The service wins on the key it names; the one it does not name survives.
+    try testing.expectEqualStrings("LOG_LEVEL=debug", env[0]);
+    try testing.expectEqualStrings("REGION=local", env[1]);
+    try testing.expectEqualStrings("PORT=3000", env[2]);
+}
+
+test "defaults refuses the two keys that cannot be shared" {
+    for ([_][]const u8{ "run", "after" }) |key| {
+        const src = try std.fmt.allocPrint(testing.allocator,
+            "defaults:\n  {s}: \"x\"\nservices:\n  a:\n    run: \"run a\"\n",
+            .{key},
+        );
+        defer testing.allocator.free(src);
+
+        var diag: Diagnostic = .{};
+        defer diag.deinit(testing.allocator);
+        try testing.expectError(error.Invalid, loadForTest(src, &.{}, &diag));
+        try testing.expect(std.mem.indexOf(u8, diag.message.?, "cannot be a default") != null);
+    }
 }
 
 test "a comment on the line after a flow sequence is legal" {
-    // Pins the local patch in src/vendor/yaml/Parser.zig. athena's config has
+    // Pins the local patch in src/vendor/yaml/Parser.zig. A real config has
     // exactly this shape, so a vendor re-sync that drops the patch fails here
     // rather than at 9am on a Monday.
     const src =
-        \\processes:
+        \\services:
         \\  gate:
-        \\    dotenv: [".env"]
+        \\    env_file: [".env"]
         \\    # Upstream zig-yaml rejects this comment. It is valid YAML.
-        \\    command: "bash scripts/wait-postgres.sh"
+        \\    run: "bash scripts/wait-postgres.sh"
         \\
     ;
     var cfg = try loadForTest(src, &.{}, null);
@@ -993,10 +1367,10 @@ test "a comment on the line after a flow sequence is legal" {
     // The check the patch narrowed must still catch a genuinely unseparated
     // comment, or the patch has simply deleted a rule instead of fixing it.
     const adjacent =
-        \\processes:
+        \\services:
         \\  gate:
-        \\    dotenv: [".env"]# touching the bracket
-        \\    command: "x"
+        \\    env_file: [".env"]# touching the bracket
+        \\    run: "x"
         \\
     ;
     try testing.expectError(error.Invalid, loadForTest(adjacent, &.{}, null));
@@ -1004,13 +1378,13 @@ test "a comment on the line after a flow sequence is legal" {
 
 test "expands ${VAR} and $VAR, unset becoming empty" {
     const src =
-        \\processes:
+        \\services:
         \\  go:
-        \\    command: "go run ."
-        \\    environment:
-        \\      - "PATH=${ROOT}/shims:${PATH}"
-        \\      - "HTTPS_PROXY=${TRACE_PROXY}"
-        \\      - "BARE=$ROOT"
+        \\    run: "go run ."
+        \\    env:
+        \\      PATH: "${ROOT}/shims:${PATH}"
+        \\      HTTPS_PROXY: "${TRACE_PROXY}"
+        \\      BARE: "$ROOT"
         \\
     ;
     var cfg = try loadForTest(src, &.{
@@ -1028,9 +1402,9 @@ test "expands ${VAR} and $VAR, unset becoming empty" {
 
 test "rejects shell parameter expansion instead of passing it through" {
     const src =
-        \\processes:
+        \\services:
         \\  go:
-        \\    command: "echo ${MISSING:-fallback}"
+        \\    run: "echo ${MISSING:-fallback}"
         \\
     ;
     var diag: Diagnostic = .{};
@@ -1041,9 +1415,9 @@ test "rejects shell parameter expansion instead of passing it through" {
 
 test "rejects an unsupported field rather than ignoring it" {
     const src =
-        \\processes:
+        \\services:
         \\  go:
-        \\    command: "go run ."
+        \\    run: "go run ."
         \\    log_location: "/tmp/go.log"
         \\
     ;
@@ -1051,45 +1425,36 @@ test "rejects an unsupported field rather than ignoring it" {
     defer diag.deinit(testing.allocator);
     try testing.expectError(error.Invalid, loadForTest(src, &.{}, &diag));
     try testing.expect(std.mem.indexOf(u8, diag.message.?, "log_location") != null);
-    try testing.expect(std.mem.indexOf(u8, diag.message.?, "processes.go") != null);
+    try testing.expect(std.mem.indexOf(u8, diag.message.?, "services.go") != null);
 }
 
-test "rejects a dependency on a process that does not exist" {
+test "rejects a dependency on a service that does not exist" {
     const src =
-        \\processes:
+        \\services:
         \\  go:
-        \\    command: "go run ."
-        \\    depends_on:
-        \\      db:
-        \\        condition: process_healthy
+        \\    run: "go run ."
+        \\    after: [db]
         \\
     ;
     var diag: Diagnostic = .{};
     defer diag.deinit(testing.allocator);
     try testing.expectError(error.Invalid, loadForTest(src, &.{}, &diag));
-    try testing.expect(std.mem.indexOf(u8, diag.message.?, "\"db\" is not a process") != null);
+    try testing.expect(std.mem.indexOf(u8, diag.message.?, "\"db\" is not a service") != null);
 }
 
 test "rejects a dependency cycle instead of stalling on it at runtime" {
     const src =
-        \\processes:
+        \\services:
         \\  a:
-        \\    command: "run a"
-        \\    depends_on:
-        \\      c:
-        \\        condition: process_started
+        \\    run: "run a"
+        \\    after: [c]
         \\  b:
-        \\    command: "run b"
-        \\    depends_on:
-        \\      a:
-        \\        condition: process_started
+        \\    run: "run b"
+        \\    after: [a]
         \\  c:
-        \\    command: "run c"
-        \\    depends_on:
-        \\      b:
-        \\        condition: process_started
-        \\  free:
-        \\    command: "run free"
+        \\    run: "run c"
+        \\    after: [b]
+        \\  free: "run free"
         \\
     ;
     var diag: Diagnostic = .{};
@@ -1102,19 +1467,14 @@ test "rejects a dependency cycle instead of stalling on it at runtime" {
 
 test "a chain that is merely deep is not a cycle" {
     const src =
-        \\processes:
-        \\  a:
-        \\    command: "run a"
+        \\services:
+        \\  a: "run a"
         \\  b:
-        \\    command: "run b"
-        \\    depends_on:
-        \\      a:
-        \\        condition: process_started
+        \\    run: "run b"
+        \\    after: [a]
         \\  c:
-        \\    command: "run c"
-        \\    depends_on:
-        \\      b:
-        \\        condition: process_started
+        \\    run: "run c"
+        \\    after: [b]
         \\
     ;
     var cfg = try loadForTest(src, &.{}, null);
@@ -1122,103 +1482,252 @@ test "a chain that is merely deep is not a cycle" {
     try testing.expectEqual(@as(usize, 3), cfg.workers.len);
 }
 
-test "rejects a condition the target can never reach" {
-    // process_healthy without a probe would wait forever with nothing on
-    // screen to say why — exactly the silent divergence this project refuses.
-    const healthy =
-        \\processes:
-        \\  db:
-        \\    command: "postgres"
+test "waiting on a service with no ready block warns rather than refuses" {
+    // The wait is still honoured, it just cannot mean more than "it started".
+    // Refusing would make `after` unusable against a service that has no
+    // observable ready signal; saying nothing would let "waits for the
+    // database" quietly mean "waits for the database's pid".
+    const src =
+        \\services:
+        \\  db: "postgres"
         \\  go:
-        \\    command: "go run ."
-        \\    depends_on:
-        \\      db:
-        \\        condition: process_healthy
+        \\    run: "go run ."
+        \\    after: [db]
+        \\
+    ;
+    var cfg = try loadForTest(src, &.{}, null);
+    defer cfg.deinit();
+
+    const go = cfg.workers[cfg.find("go").?];
+    try testing.expectEqual(Condition.process_started, go.depends_on[0].condition);
+    try testing.expectEqual(@as(usize, 1), cfg.warnings.len);
+    try testing.expect(std.mem.indexOf(u8, cfg.warnings[0], "no \"ready:\" block") != null);
+}
+
+test "the four condition words reach the five states" {
+    const src =
+        \\services:
+        \\  probed:
+        \\    run: "a"
+        \\    ready:
+        \\      exec: "true"
+        \\  logged:
+        \\    run: "b"
+        \\    ready:
+        \\      log: "up"
+        \\  gate: "c"
+        \\  waiter:
+        \\    run: "d"
+        \\    after:
+        \\      probed: ready
+        \\      logged: ready
+        \\      gate: ok
+        \\
+    ;
+    var cfg = try loadForTest(src, &.{}, null);
+    defer cfg.deinit();
+
+    const deps = cfg.workers[cfg.find("waiter").?].depends_on;
+    try testing.expectEqual(Condition.process_healthy, deps[0].condition);
+    try testing.expectEqual(Condition.process_log_ready, deps[1].condition);
+    try testing.expectEqual(Condition.process_completed_successfully, deps[2].condition);
+
+    const started =
+        \\services:
+        \\  a: "run a"
+        \\  b:
+        \\    run: "run b"
+        \\    after:
+        \\      a: started
+        \\
+    ;
+    var cfg2 = try loadForTest(started, &.{}, null);
+    defer cfg2.deinit();
+    try testing.expectEqual(Condition.process_started, cfg2.workers[1].depends_on[0].condition);
+    // `started` asked for explicitly is not the fallback, so it does not warn.
+    try testing.expectEqual(@as(usize, 0), cfg2.warnings.len);
+}
+
+test "rejects a condition word that is not one of the four" {
+    const src =
+        \\services:
+        \\  a: "run a"
+        \\  b:
+        \\    run: "run b"
+        \\    after:
+        \\      a: process_healthy
         \\
     ;
     var diag: Diagnostic = .{};
     defer diag.deinit(testing.allocator);
-    try testing.expectError(error.Invalid, loadForTest(healthy, &.{}, &diag));
-    try testing.expect(std.mem.indexOf(u8, diag.message.?, "no readiness_probe") != null);
-
-    const log_ready =
-        \\processes:
-        \\  db:
-        \\    command: "postgres"
-        \\  go:
-        \\    command: "go run ."
-        \\    depends_on:
-        \\      db:
-        \\        condition: process_log_ready
-        \\
-    ;
-    var diag2: Diagnostic = .{};
-    defer diag2.deinit(testing.allocator);
-    try testing.expectError(error.Invalid, loadForTest(log_ready, &.{}, &diag2));
-    try testing.expect(std.mem.indexOf(u8, diag2.message.?, "no ready_log_line") != null);
+    try testing.expectError(error.Invalid, loadForTest(src, &.{}, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message.?, "started, ready, done or ok") != null);
 }
 
-test "ready_log_line and shutdown round-trip, with process-compose's defaults" {
-    const src =
-        \\processes:
-        \\  db:
-        \\    command: "postgres"
-        \\    ready_log_line: "database system is ready to accept connections"
-        \\    shutdown:
-        \\      signal: 2
-        \\      timeout_seconds: 30
+test "ready takes exactly one of http, exec and log" {
+    const both =
+        \\services:
         \\  go:
-        \\    command: "go run ."
-        \\    depends_on:
-        \\      db:
-        \\        condition: process_log_ready
+        \\    run: "go run ."
+        \\    ready:
+        \\      exec: "true"
+        \\      log: "up"
+        \\
+    ;
+    try testing.expectError(error.Invalid, loadForTest(both, &.{}, null));
+
+    const neither =
+        \\services:
+        \\  go:
+        \\    run: "go run ."
+        \\    ready:
+        \\      every: 5s
+        \\
+    ;
+    try testing.expectError(error.Invalid, loadForTest(neither, &.{}, null));
+
+    // Timing next to `log` is refused rather than ignored: there is no period
+    // to set when the match happens as the output arrives.
+    const timed_log =
+        \\services:
+        \\  go:
+        \\    run: "go run ."
+        \\    ready:
+        \\      log: "up"
+        \\      every: 5s
+        \\
+    ;
+    var diag: Diagnostic = .{};
+    defer diag.deinit(testing.allocator);
+    try testing.expectError(error.Invalid, loadForTest(timed_log, &.{}, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message.?, "no meaning next to") != null);
+}
+
+test "a ready URL is split into what the probe needs, and its limits are caught here" {
+    const src =
+        \\services:
+        \\  bare:
+        \\    run: "a"
+        \\    ready:
+        \\      http: "http://localhost:8080"
+        \\  defaulted:
+        \\    run: "b"
+        \\    ready:
+        \\      http: "http://10.0.0.1/healthz"
+        \\
+    ;
+    var cfg = try loadForTest(src, &.{}, null);
+    defer cfg.deinit();
+
+    // No path means "/", not the empty string.
+    const bare = cfg.workers[cfg.find("bare").?].readiness_probe.?.target.http_get;
+    try testing.expectEqualStrings("localhost", bare.host);
+    try testing.expectEqual(@as(u16, 8080), bare.port);
+    try testing.expectEqualStrings("/", bare.path);
+
+    // No port means 80.
+    const defaulted = cfg.workers[cfg.find("defaulted").?].readiness_probe.?.target.http_get;
+    try testing.expectEqual(@as(u16, 80), defaulted.port);
+    try testing.expectEqualStrings("/healthz", defaulted.path);
+
+    // Both of the Probe's limits are refused at load rather than at spawn.
+    const cases = [_][2][]const u8{
+        .{ "https://127.0.0.1:8443/", "https is not supported" },
+        .{ "http://db.internal:5432/", "IPv4 literal" },
+        .{ "127.0.0.1:8080", "expected a URL" },
+        .{ "http://127.0.0.1:notaport/", "not a port number" },
+    };
+    for (cases) |c| {
+        const bad = try std.fmt.allocPrint(testing.allocator,
+            "services:\n  go:\n    run: \"x\"\n    ready:\n      http: \"{s}\"\n",
+            .{c[0]},
+        );
+        defer testing.allocator.free(bad);
+
+        var d: Diagnostic = .{};
+        defer d.deinit(testing.allocator);
+        try testing.expectError(error.Invalid, loadForTest(bad, &.{}, &d));
+        try testing.expect(std.mem.indexOf(u8, d.message.?, c[1]) != null);
+    }
+}
+
+test "durations take the units the command line takes, and refuse the rest" {
+    const src =
+        \\services:
+        \\  go:
+        \\    run: "go run ."
+        \\    ready:
+        \\      exec: "true"
+        \\      delay: 2m
+        \\      every: 90
+        \\      timeout: 1h
+        \\
+    ;
+    var cfg = try loadForTest(src, &.{}, null);
+    defer cfg.deinit();
+
+    const p = cfg.workers[0].readiness_probe.?;
+    try testing.expectEqual(@as(u32, 120), p.initial_delay_seconds);
+    // A bare number is seconds, the same as `--since 30` on the command line.
+    try testing.expectEqual(@as(u32, 90), p.period_seconds);
+    try testing.expectEqual(@as(u32, 3600), p.timeout_seconds);
+
+    // Sub-second is refused rather than rounded to 0s or 1s.
+    const sub =
+        \\services:
+        \\  go:
+        \\    run: "go run ."
+        \\    ready:
+        \\      exec: "true"
+        \\      every: 500ms
+        \\
+    ;
+    var diag: Diagnostic = .{};
+    defer diag.deinit(testing.allocator);
+    try testing.expectError(error.Invalid, loadForTest(sub, &.{}, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message.?, "whole number of seconds") != null);
+}
+
+test "stop names its signal, and an unset one is SIGTERM with a 10s grace" {
+    const src =
+        \\services:
+        \\  db:
+        \\    run: "postgres"
+        \\    stop:
+        \\      signal: SIGINT
+        \\      grace: 30s
+        \\  go: "go run ."
         \\
     ;
     var cfg = try loadForTest(src, &.{}, null);
     defer cfg.deinit();
 
     const db = cfg.workers[cfg.find("db").?];
-    try testing.expectEqualStrings(
-        "database system is ready to accept connections",
-        db.ready_log_line.?,
-    );
     try testing.expectEqual(@as(u8, 2), db.shutdown.signal);
     try testing.expectEqual(@as(u32, 30), db.shutdown.timeout_seconds);
 
-    // Unset shutdown means SIGTERM with a 10s grace, not signal 0 and no wait.
     const go = cfg.workers[cfg.find("go").?];
     try testing.expectEqual(@as(u8, 15), go.shutdown.signal);
     try testing.expectEqual(@as(u32, 10), go.shutdown.timeout_seconds);
-}
 
-test "a probe needs exactly one of exec or http_get" {
-    const both =
-        \\processes:
-        \\  go:
-        \\    command: "go run ."
-        \\    readiness_probe:
-        \\      exec:
-        \\        command: "true"
-        \\      http_get:
-        \\        port: 8080
+    // A number is not a signal name, however much it looks like one.
+    const numbered =
+        \\services:
+        \\  db:
+        \\    run: "postgres"
+        \\    stop:
+        \\      signal: 2
         \\
     ;
-    try testing.expectError(error.Invalid, loadForTest(both, &.{}, null));
-
-    const neither =
-        \\processes:
-        \\  go:
-        \\    command: "go run ."
-        \\    readiness_probe:
-        \\      period_seconds: 5
-        \\
-    ;
-    try testing.expectError(error.Invalid, loadForTest(neither, &.{}, null));
+    var diag: Diagnostic = .{};
+    defer diag.deinit(testing.allocator);
+    try testing.expectError(error.Invalid, loadForTest(numbered, &.{}, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message.?, "unknown signal") != null);
 }
 
-test "a missing command is an error, not an empty string" {
+test "a missing run is an error, not an empty string" {
     const src =
-        \\processes:
+        \\services:
         \\  go:
         \\    description: "no command here"
         \\
@@ -1226,5 +1735,62 @@ test "a missing command is an error, not an empty string" {
     var diag: Diagnostic = .{};
     defer diag.deinit(testing.allocator);
     try testing.expectError(error.Invalid, loadForTest(src, &.{}, &diag));
-    try testing.expect(std.mem.indexOf(u8, diag.message.?, "missing \"command\"") != null);
+    try testing.expect(std.mem.indexOf(u8, diag.message.?, "missing \"run\"") != null);
+}
+
+test "shell is a pair, and anything else is refused" {
+    var diag: Diagnostic = .{};
+    defer diag.deinit(testing.allocator);
+    try testing.expectError(error.Invalid, loadForTest(
+        "shell: [bash]\nservices:\n  a: \"run a\"\n",
+        &.{},
+        &diag,
+    ));
+    try testing.expect(std.mem.indexOf(u8, diag.message.?, "[bash, -c]") != null);
+}
+
+test "a document ending on a bare key is an error, not a panic" {
+    // Pins the second local patch in src/vendor/yaml/Parser.zig. Upstream reads
+    // one token past the end and indexes the token array with it, so a config
+    // that stops mid-key takes devrun down with a bounds panic instead of
+    // telling its author what is wrong.
+    try testing.expectError(error.Invalid, loadForTest("services:\n", &.{}, null));
+    try testing.expectError(error.Invalid, loadForTest("services:\n  api:\n", &.{}, null));
+}
+
+test "a mapping written on one line is refused rather than read as nothing" {
+    // The vendored parser resolves `{a: b}` to an empty value instead of a map,
+    // so every place that wants a mapping has to turn that silence into a
+    // sentence. Without this the dependency below would simply not exist, and
+    // nothing would say so.
+    const src =
+        \\services:
+        \\  db: "postgres"
+        \\  api:
+        \\    run: "pnpm dev"
+        \\    after: {db: ready}
+        \\
+    ;
+    var diag: Diagnostic = .{};
+    defer diag.deinit(testing.allocator);
+    try testing.expectError(error.Invalid, loadForTest(src, &.{}, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message.?, "read as empty here") != null);
+
+    // And the same for a block that is not `after`.
+    const stop =
+        \\services:
+        \\  db:
+        \\    run: "postgres"
+        \\    stop: {signal: SIGINT}
+        \\
+    ;
+    var diag2: Diagnostic = .{};
+    defer diag2.deinit(testing.allocator);
+    try testing.expectError(error.Invalid, loadForTest(stop, &.{}, &diag2));
+    try testing.expect(std.mem.indexOf(u8, diag2.message.?, "across lines") != null);
+}
+
+test "an empty or absent services section is refused" {
+    try testing.expectError(error.Invalid, loadForTest("shell: [bash, \"-c\"]\n", &.{}, null));
+    try testing.expectError(error.Invalid, loadForTest("services:\n", &.{}, null));
 }

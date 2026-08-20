@@ -34,16 +34,16 @@ const usage =
     \\devrun — process runner for local development
     \\
     \\Usage:
-    \\  devrun up [--detach]            Start every process and supervise them
+    \\  devrun up [--detach]            Start every service and supervise them
     \\  devrun run CMD...               Supervise one command, with no config file
     \\  devrun down                     Shut a running Session down
     \\  devrun wait [--timeout D]       Block until everything is ready, or fail
-    \\  devrun logs [NAME...]           Every process's output, merged by time
+    \\  devrun logs [NAME...]           Every service's output, merged by time
     \\  devrun errors                   What broke, and the log under it
-    \\  devrun status [--json]          What each process is doing right now
-    \\  devrun samples                  Per-process CPU, memory, and disk I/O
+    \\  devrun status [--json]          What each service is doing right now
+    \\  devrun samples                  Per-service CPU, memory, and disk I/O
     \\  devrun config [FILE]            What devrun understood from a config
-    \\  devrun start|stop|restart NAME  Act on one process of a running Session
+    \\  devrun start|stop|restart NAME  Act on one service of a running Session
     \\  devrun clean [--all]            Delete saved logs from previous runs
     \\  devrun init [-o FILE]           Write the agent instructions into AGENTS.md
     \\  devrun update                   Replace this binary with the latest release
@@ -73,14 +73,14 @@ const usage =
     \\pnpm. Use `--` first if the command's own name starts with a dash.
     \\
     \\Other options:
-    \\  -f FILE            Config to read (default: process-compose.yaml)
+    \\  -f FILE            Config to read (default: devrun.yml, or devrun.yaml)
     \\  --plain            Never draw the TUI, even on a terminal
     \\  --detach, -d       Run the Session in the background and return once
-    \\                     every process is ready
+    \\                     every service is ready
     \\  --timeout D        How long `wait` and `up --detach` give it (default 2m)
     \\  --keep N           Log directories to keep from previous runs (default 10).
     \\                     0 keeps every one of them.
-    \\  --window-bytes N   In-memory log cache across all processes (default 1M).
+    \\  --window-bytes N   In-memory log cache across all services (default 1M).
     \\                     Accepts K/M/G. Scrollback past it is read from the
     \\                     log file, so this trades RSS for nothing much.
     \\
@@ -90,6 +90,23 @@ const usage =
     \\and trims the noise; `--raw --all` gives them back.
     \\
 ;
+
+/// `devrun.yml`, or `devrun.yaml` if that is the one on disk.
+///
+/// Both spellings are accepted because every tool that takes only one of them
+/// collects bug reports from people who typed the other. Having both in one
+/// repo is refused rather than resolved by precedence: which file is live would
+/// then depend on a rule nobody reads, and the dead one would go on being
+/// edited.
+fn resolveConfigPath(io: std.Io) error{Ambiguous}![]const u8 {
+    const cwd = std.Io.Dir.cwd();
+    const yml = cwd.access(io, "devrun.yml", .{}) != error.FileNotFound;
+    const yaml = cwd.access(io, "devrun.yaml", .{}) != error.FileNotFound;
+    if (yml and yaml) return error.Ambiguous;
+    if (yaml) return "devrun.yaml";
+    // Neither on disk: name the spelling the error should talk about.
+    return "devrun.yml";
+}
 
 pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
@@ -142,6 +159,17 @@ pub fn main(init: std.process.Init) !u8 {
         return 2;
     };
 
+    if (!cli.path_given) {
+        cli.path = resolveConfigPath(io) catch {
+            try err(io,
+                "devrun: this directory has both devrun.yml and devrun.yaml. " ++
+                    "Keep one, or name the one you mean with -f.\n",
+                .{},
+            );
+            return 2;
+        };
+    }
+
     const cmd = args[1];
     if (std.mem.eql(u8, cmd, "config")) {
         // `devrun config path.yaml` reads more naturally than -f here, and is
@@ -172,7 +200,7 @@ pub fn main(init: std.process.Init) !u8 {
     for ([_][]const u8{ "start", "stop", "restart" }) |verb| {
         if (!std.mem.eql(u8, cmd, verb)) continue;
         if (rest.len == 0) {
-            try err(io, "devrun: {s} needs a process name\n", .{verb});
+            try err(io, "devrun: {s} needs a service name\n", .{verb});
             return 2;
         }
         return cli.ask(out, verb, rest[0]);
@@ -194,7 +222,10 @@ const Cli = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     environ: *const std.process.Environ.Map,
-    path: []const u8 = "process-compose.yaml",
+    path: []const u8 = "devrun.yml",
+    /// Whether `-f` named the config. Without it, `resolveConfigPath` picks
+    /// between `devrun.yml` and `devrun.yaml`.
+    path_given: bool = false,
     force_plain: bool = false,
     /// Zero means "whatever the Supervisor's default is", so the default lives
     /// in one place rather than being restated here.
@@ -276,6 +307,7 @@ const Cli = struct {
                 i += 1;
                 if (i >= args.len) return error.MissingValue;
                 self.path = args[i];
+                self.path_given = true;
             } else if (std.mem.eql(u8, a, "-o") or std.mem.eql(u8, a, "--output")) {
                 i += 1;
                 if (i >= args.len) return error.MissingValue;
@@ -408,10 +440,16 @@ const Cli = struct {
     }
 
     fn load(self: Cli, diag: *config.Diagnostic) !config.Config {
-        return config.load(self.gpa, self.path, .{
+        const cfg = try config.load(self.gpa, self.path, .{
             .io = self.io,
             .environ = self.environ,
         }, diag);
+        // To stderr, so a warning never lands in the output of `devrun config`
+        // when that is being read by something other than a person.
+        for (cfg.warnings) |w| {
+            err(self.io, "devrun: {s}: {s}\n", .{ self.path, w }) catch {};
+        }
+        return cfg;
     }
 
     fn reportLoadFailure(self: Cli, diag: config.Diagnostic, e: anyerror) !u8 {
@@ -436,30 +474,39 @@ const Cli = struct {
         for (cfg.workers) |w| {
             try out.print("{s}\n", .{w.name});
             if (w.description) |d| try out.print("  description   {s}\n", .{d});
-            try out.print("  command       {s}\n", .{w.command});
-            if (w.working_dir) |d| try out.print("  working_dir   {s}\n", .{d});
+            try out.print("  run           {s}\n", .{w.command});
+            if (w.working_dir) |d| try out.print("  dir           {s}\n", .{d});
             try out.print("  restart       {t}\n", .{w.restart});
-            try out.print("  shutdown      signal {d}, {d}s grace\n", .{
-                w.shutdown.signal,
+            try out.print("  stop          {s}, {d}s grace\n", .{
+                config.signalName(w.shutdown.signal),
                 w.shutdown.timeout_seconds,
             });
-            for (w.dotenv) |f| try out.print("  dotenv        {s}\n", .{f});
+            for (w.dotenv) |f| try out.print("  env_file      {s}\n", .{f});
             for (w.environment) |e| try out.print("  env           {s}\n", .{e});
+            // The condition is printed as the word the file would use, not as
+            // the state the Supervisor tracks: this is a view of the config,
+            // and `devrun config` that cannot be pasted back is a worse view.
             for (w.depends_on) |d| {
-                try out.print("  depends_on    {s} ({t})\n", .{ d.name, d.condition });
+                try out.print("  after         {s}: {s}\n", .{ d.name, config.conditionWord(d.condition) });
             }
-            if (w.ready_log_line) |l| try out.print("  log ready     \"{s}\"\n", .{l});
+            if (w.ready_log_line) |l| try out.print("  ready log     \"{s}\"\n", .{l});
             if (w.readiness_probe) |p| {
                 switch (p.target) {
-                    .exec => |c| try out.print("  probe exec    {s}\n", .{c}),
+                    .exec => |c| try out.print("  ready exec    {s}\n", .{c}),
                     .http_get => |h| try out.print(
-                        "  probe http    {s}://{s}:{d}{s}\n",
+                        "  ready http    {s}://{s}:{d}{s}\n",
                         .{ h.scheme, h.host, h.port, h.path },
                     ),
                 }
                 try out.print(
-                    "                delay={d}s period={d}s timeout={d}s failures={d}\n",
-                    .{ p.initial_delay_seconds, p.period_seconds, p.timeout_seconds, p.failure_threshold },
+                    "                delay={d}s every={d}s timeout={d}s passes={d} fails={d}\n",
+                    .{
+                        p.initial_delay_seconds,
+                        p.period_seconds,
+                        p.timeout_seconds,
+                        p.success_threshold,
+                        p.failure_threshold,
+                    },
                 );
             }
             try out.writeAll("\n");
@@ -488,7 +535,7 @@ const Cli = struct {
                     "        and no logs in {s}.\n",
                     .{dir},
                 ),
-                else => try err(self.io, "devrun: cannot list processes: {t}\n", .{e}),
+                else => try err(self.io, "devrun: cannot list services: {t}\n", .{e}),
             }
             return 1;
         };
@@ -534,7 +581,7 @@ const Cli = struct {
             for (known) |k| {
                 if (std.mem.eql(u8, k, name)) break;
             } else {
-                try err(self.io, "devrun: \"{s}\" is not a process here.\n", .{name});
+                try err(self.io, "devrun: \"{s}\" is not a service here.\n", .{name});
                 try err(self.io, "        Known: ", .{});
                 for (known, 0..) |k, i| {
                     try err(self.io, "{s}{s}", .{ if (i > 0) ", " else "", k });
@@ -879,9 +926,9 @@ const Cli = struct {
     ///
     /// The point is not to add a feature to the Session, it is to remove the
     /// config file as an entry requirement. Most repos do not have a
-    /// `process-compose.yaml`, and until now that meant devrun did nothing at
-    /// all in them. `devrun run pnpm dev` gets the Archive, the Index, and
-    /// therefore `devrun logs`, `errors`, `wait` and `--detach` in any repo.
+    /// `devrun.yml`, and without this devrun would do nothing at all in them.
+    /// `devrun run pnpm dev` gets the Archive, the Index, and therefore
+    /// `devrun logs`, `errors`, `wait` and `--detach` in any repo.
     fn runCommand(self: Cli, out: *std.Io.Writer, argv: []const []const u8) !u8 {
         // `--shell` hands the words over untouched for the shell to split.
         // The default quotes them, because the caller's own shell has already
@@ -1155,8 +1202,8 @@ const agent_doc = begin_marker ++
     \\
     \\## Running this project's services
     \\
-    \\`devrun` runs every service in `process-compose.yaml` at once and keeps
-    \\each one's output in a plain file under `.devrun/logs/latest/`. Prefer it over
+    \\`devrun` runs every service in `devrun.yml` at once and keeps each one's
+    \\output in a plain file under `.devrun/logs/latest/`. Prefer it over
     \\running a single dev server in the background: with one server you only
     \\see that server's output, and the error is usually in another one.
     \\
@@ -1167,7 +1214,7 @@ const agent_doc = begin_marker ++
     \\$ devrun down             # stop everything
     \\```
     \\
-    \\With no `process-compose.yaml`, supervise one command instead. The same
+    \\With no `devrun.yml`, supervise one command instead. The same
     \\`logs`, `errors` and `down` work against it.
     \\
     \\```console

@@ -141,7 +141,7 @@ pub fn writeStatus(reply: []const u8, json: bool, out: *std.Io.Writer) !void {
         count += 1;
     }
     if (count == 0) {
-        try out.writeAll("devrun: the Session has no processes.\n");
+        try out.writeAll("devrun: the Session has no services.\n");
         return;
     }
 
@@ -217,22 +217,22 @@ pub fn writeErrors(
         if (r.broken()) broken_count += 1;
     }
     if (total == 0) {
-        try out.writeAll("devrun: the Session has no processes.\n");
+        try out.writeAll("devrun: the Session has no services.\n");
         return false;
     }
 
     // The headline first, because it is the whole answer most of the time and
     // a reader should not have to scan a log tail to find out there wasn't one.
     if (broken_count == 0) {
-        try out.print("devrun: all {d} process{s} healthy.\n", .{
+        try out.print("devrun: all {d} service{s} healthy.\n", .{
             total,
-            if (total == 1) " is" else "es are",
+            if (total == 1) " is" else "s are",
         });
     } else {
-        try out.print("devrun: {d} of {d} process{s} broken.\n", .{
+        try out.print("devrun: {d} of {d} service{s} broken.\n", .{
             broken_count,
             total,
-            if (total == 1) "" else "es",
+            if (total == 1) "" else "s",
         });
     }
 
@@ -308,7 +308,7 @@ fn sweepHealthy(
     }, &sink.writer);
     if (found.emitted == 0) return 0;
 
-    try out.print("\ndevrun: {d} error-shaped line{s} from processes that are still up.\n", .{
+    try out.print("\ndevrun: {d} error-shaped line{s} from services that are still up.\n", .{
         found.emitted,
         if (found.emitted == 1) "" else "s",
     });
@@ -454,7 +454,7 @@ test "errors leads with the headline and says so when nothing is wrong" {
 
     try testing.expect(!any);
     try testing.expectEqualStrings(
-        "devrun: all 2 processes are healthy.\n" ++
+        "devrun: all 2 services are healthy.\n" ++
             "devrun: nothing error-shaped in the logs either.\n",
         w.buffered(),
     );
@@ -471,7 +471,7 @@ test "errors names what broke, its exit, and that it wrote nothing" {
 
     try testing.expect(any);
     try testing.expectEqualStrings(
-        "devrun: 1 of 2 processes broken.\n" ++
+        "devrun: 1 of 2 services broken.\n" ++
             "\nworker  failed  exit 1  after 3 restarts\n" ++
             "  (wrote nothing)\n",
         w.buffered(),

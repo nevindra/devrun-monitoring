@@ -140,8 +140,8 @@ pub const Runtime = struct {
     restarts: u32 = 0,
     /// When a restart may happen. Backoff exists because a Worker that fails
     /// instantly under `restart: always` would otherwise spin the loop at
-    /// 100% CPU — process-compose has `backoff_seconds` for this; devrun does
-    /// not read that field, so it derives one instead.
+    /// 100% CPU. Derived rather than configured: a knob for it would be one
+    /// more thing to get wrong in a file, for a number nobody tunes.
     restart_at_ms: u64 = 0,
     /// When the ladder escalates from the configured signal to SIGKILL.
     kill_at_ms: u64 = 0,
@@ -841,10 +841,9 @@ fn buildArgv(
     return argv.ptr;
 }
 
-/// Layers the environment the way process-compose does: the OS environment
-/// first, then each `dotenv` file, then the explicit `environment` list. Later
-/// layers win, so a value written in the config beats one inherited from the
-/// shell that launched devrun.
+/// Layers the environment: the OS environment first, then each `env_file`, then
+/// the explicit `env` mapping. Later layers win, so a value written in the
+/// config beats one inherited from the shell that launched devrun.
 fn buildEnv(
     arena: Allocator,
     opts: Options,
@@ -1087,14 +1086,12 @@ test "a Gate runs to completion before its dependant starts" {
     defer gpa.free(dir);
 
     var cfg = try loadCfg(gpa,
-        \\processes:
-        \\  gate:
-        \\    command: "echo gate-ran"
-        \\  after:
-        \\    command: "echo after-ran"
-        \\    depends_on:
-        \\      gate:
-        \\        condition: process_completed_successfully
+        \\services:
+        \\  gate: "echo gate-ran"
+        \\  dependant:
+        \\    run: "echo after-ran"
+        \\    after:
+        \\      gate: ok
         \\
     );
     defer cfg.deinit();
@@ -1118,14 +1115,12 @@ test "a Gate that fails leaves its dependant skipped, not waiting forever" {
     defer gpa.free(dir);
 
     var cfg = try loadCfg(gpa,
-        \\processes:
-        \\  gate:
-        \\    command: "exit 3"
-        \\  after:
-        \\    command: "echo SHOULD-NOT-RUN"
-        \\    depends_on:
-        \\      gate:
-        \\        condition: process_completed_successfully
+        \\services:
+        \\  gate: "exit 3"
+        \\  dependant:
+        \\    run: "echo SHOULD-NOT-RUN"
+        \\    after:
+        \\      gate: ok
         \\
     );
     defer cfg.deinit();
@@ -1148,9 +1143,8 @@ test "output reaches the Archive byte-for-byte, ANSI included" {
     defer gpa.free(dir);
 
     var cfg = try loadCfg(gpa,
-        \\processes:
-        \\  noisy:
-        \\    command: "printf 'plain\nESC[31mred\n'"
+        \\services:
+        \\  noisy: "printf 'plain\nESC[31mred\n'"
         \\
     );
     defer cfg.deinit();
@@ -1178,9 +1172,8 @@ test "a Worker that out-runs the loop is throttled, not killed" {
     // pipe fills and dies — `yes | head` exits 1 after exactly one buffer.
     // The Worker blocking instead is the entire point.
     var cfg = try loadCfg(gpa,
-        \\processes:
-        \\  firehose:
-        \\    command: "yes 0123456789abcdef0123456789abcdef | head -c 4000000"
+        \\services:
+        \\  firehose: "yes 0123456789abcdef0123456789abcdef | head -c 4000000"
         \\
     );
     defer cfg.deinit();
@@ -1210,11 +1203,11 @@ test "a Group's grandchildren are killed with it, not orphaned" {
     defer gpa.free(dir);
 
     var cfg = try loadCfg(gpa,
-        \\processes:
+        \\services:
         \\  parent:
-        \\    command: "sleep 120 & echo spawned; wait"
-        \\    shutdown:
-        \\      timeout_seconds: 1
+        \\    run: "sleep 120 & echo spawned; wait"
+        \\    stop:
+        \\      grace: 1s
         \\
     );
     defer cfg.deinit();

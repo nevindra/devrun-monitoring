@@ -181,11 +181,11 @@ pub fn handle(line: []const u8, sup: *Supervisor, w: *std.Io.Writer) void {
     }
 
     const name = arg orelse {
-        w.print("error: {s} needs a process name\n", .{verb}) catch {};
+        w.print("error: {s} needs a service name\n", .{verb}) catch {};
         return;
     };
     const i = sup.cfg.find(name) orelse {
-        w.print("error: \"{s}\" is not a process in this config\n", .{name}) catch {};
+        w.print("error: \"{s}\" is not a service in this config\n", .{name}) catch {};
         return;
     };
 
@@ -299,7 +299,7 @@ pub fn ask(path: [:0]const u8, line: []const u8, buf: []u8) ![]const u8 {
 
 const testing = std.testing;
 
-test "an unknown process is refused by name rather than ignored" {
+test "an unknown service is refused by name rather than ignored" {
     // The parser is the part worth testing without a Session: it decides what
     // a line means, and a wrong answer there is what would make `devrun stop`
     // silently do nothing.
@@ -310,8 +310,8 @@ test "an unknown process is refused by name rather than ignored" {
     try testing.expectEqualStrings("stop", it.next().?);
     try testing.expect(it.next() == null);
 
-    w.print("error: {s} needs a process name\n", .{"stop"}) catch {};
-    try testing.expectEqualStrings("error: stop needs a process name\n", w.buffered());
+    w.print("error: {s} needs a service name\n", .{"stop"}) catch {};
+    try testing.expectEqualStrings("error: stop needs a service name\n", w.buffered());
 }
 
 test "a socket path longer than sun_path is refused, not truncated" {

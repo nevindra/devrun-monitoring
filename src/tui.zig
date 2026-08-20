@@ -2121,11 +2121,9 @@ const Fixture = struct {
         try environ.put("PATH", "/usr/local/bin:/usr/bin:/bin");
 
         self.cfg = try config.loadSource(gpa,
-            \\processes:
-            \\  api:
-            \\    command: "true"
-            \\  web:
-            \\    command: "true"
+            \\services:
+            \\  api: "true"
+            \\  web: "true"
         , "/nonexistent", .{ .io = threaded.io(), .environ = &environ }, null);
         errdefer self.cfg.deinit();
 
