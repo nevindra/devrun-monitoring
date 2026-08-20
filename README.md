@@ -615,10 +615,12 @@ now would be a subsystem bet made on a guess.
 
 **Does it work on macOS?**
 Not yet. Nothing is built that would have to be torn out to add it: the event
-loop is `poll()` with a self-pipe rather than `epoll` with `signalfd`, and the
-resource accounting sits behind one narrow backend interface. See
-[ADR 0004](docs/adr/0004-portability-posture.md) for what a port costs and what
-it would give up.
+loop is `poll()` with a self-pipe rather than `epoll` with `signalfd`, and
+config signals are named rather than numbered. [ADR
+0004](docs/adr/0004-portability-posture.md) has the decisions behind that and
+what a port would give up; [the roadmap](docs/roadmap.md) has the worklist,
+including why `zig build -Dtarget=aarch64-macos` succeeding today means nothing
+at all.
 
 **Does it leave anything behind?**
 One directory, `.devrun/`, beside your config: the log files, the control
@@ -645,6 +647,9 @@ The non-obvious choices are written down with the reasoning that produced them:
 - [Render log bytes straight through, not through a cell grid](docs/adr/0005-render-log-bytes-through.md). Why the TUI is hand-written, against 0003.
 - [Every Session gets its own directory of Archives](docs/adr/0006-an-archive-per-session.md). Why reproducing a bug stopped deleting the evidence.
 - [Time lives beside the bytes, in a sidecar](docs/adr/0007-time-beside-the-bytes.md). How `--since` and merging work without touching the Archive.
+
+[`docs/roadmap.md`](docs/roadmap.md) is what is planned and not done: today,
+the macOS port.
 
 [`CONTEXT.md`](CONTEXT.md) is the glossary: what a Worker, a Group, a Gate, an
 Archive, and a Window each mean here, and which words are deliberately avoided.
