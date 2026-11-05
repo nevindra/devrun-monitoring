@@ -6,7 +6,12 @@ Newest first. Versions follow [semantic versioning](https://semver.org); until
 Entries say what changed for someone *using* devrun. Refactors, test additions
 and internal tidying stay in the git log, which is where they are useful.
 
-## Unreleased
+## 0.2.0
+
+devrun stands on its own. It reads its own `devrun.toml`, starts the parts of
+a stack you ask for, restarts what you edit, and teaches your coding agent how
+to use it the moment it is installed. The config format changed, so a 0.1
+config has to be rewritten; "Breaking: devrun has its own config" below says how.
 
 ### An agent skill
 
