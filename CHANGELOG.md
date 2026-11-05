@@ -6,7 +6,7 @@ Newest first. Versions follow [semantic versioning](https://semver.org); until
 Entries say what changed for someone *using* devrun. Refactors, test additions
 and internal tidying stay in the git log, which is where they are useful.
 
-## 0.2.0
+## 0.2.0 (2026-11-05)
 
 devrun stands on its own. It reads its own `devrun.toml`, starts the parts of
 a stack you ask for, restarts what you edit, and teaches your coding agent how
@@ -123,7 +123,17 @@ the suite's exit status.
 - `backoff` and `debounce` take milliseconds (`"300ms"`). Probe timings and
   `stop.timeout` stay whole seconds.
 
-## 0.1.0
+### Also
+
+- `devrun config` shows the merged `devrun.local.toml`, the profiles and which
+  one is active, restart limits, `ready.status`, stop commands and watched
+  paths.
+- The TUI and the plain view show `off` services, and say when a watched path
+  cannot be watched.
+- The README is rewritten around devrun's own config, with recipes for a
+  failing request, an e2e run, one service at a time, and no config at all.
+
+## 0.1.0 (2026-08-18)
 
 First release. Everything in the original plan is in it.
 

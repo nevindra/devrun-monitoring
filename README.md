@@ -7,7 +7,7 @@
 Start your whole stack from one `devrun.toml`. Every service's output lands in a plain file,
 and one command answers "what broke?" across all of them.
 
-[![version](https://img.shields.io/badge/version-0.2.0-2b2b2b)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.2.0-2b2b2b)](https://github.com/nevindra/devrun-monitoring/releases)
 [![license](https://img.shields.io/badge/license-MIT-2b2b2b)](LICENSE)
 [![platform](https://img.shields.io/badge/linux-x86__64%20%C2%B7%20aarch64-2b2b2b)](#install)
 [![binary](https://img.shields.io/badge/binary-1.0%20MB-2b2b2b)](#what-you-get)
@@ -233,8 +233,7 @@ devrun: services.api: unknown field "command". devrun calls it "run"
 
 A graph that could never resolve (an `after` cycle, a wait for `ready` on a
 service with no check, a wait on a service that does not exist) is refused too,
-instead of hanging the Session. The format is [TOML](https://toml.io/en/v1.0.0)
-and the reasoning is in [ADR 0008](docs/adr/0008-devrun-toml.md).
+instead of hanging the Session. The format is [TOML](https://toml.io/en/v1.0.0).
 
 <details>
 <summary><b>Full field reference</b></summary>
@@ -459,26 +458,6 @@ The default is the last 100 lines (1000 with `--since`), so a command that
 might dump a gigabyte is known to be safe before it is run. `--all` lifts the
 limit.
 
-### How it works
-
-```mermaid
-flowchart LR
-    P[process] -->|stdout| A[".devrun/logs/latest/name.log"]
-    P -->|timestamps| I["name.idx"]
-    P --> W["in-memory window, 1 MB"]
-    A --> C["devrun logs, errors, tail, grep"]
-    I --> C
-    W --> T[TUI]
-    S["control.sock"] -.->|start, stop, status, never logs| T
-```
-
-Every process writes to a plain file from the moment it spawns. The TUI is a view
-over those files, not their owner, and logs never cross the control socket, which
-stays a trivial line protocol. Every run gets its own directory with `latest`
-aimed at the newest, so restarting to reproduce a bug does not delete the log of
-the run you were reproducing. `devrun up` keeps the newest ten (`--keep N`
-changes that, `--keep 0` keeps all), and `devrun clean` clears them.
-
 ## The TUI
 
 `devrun up` on a terminal draws a TUI built for three things: read a log, take
@@ -606,8 +585,7 @@ add later.
 **Does it work on macOS?**
 Not yet. Nothing is built that would have to be torn out to add it: the event loop
 is `poll()` with a self-pipe, and resource accounting sits behind one narrow
-backend interface. [ADR 0004](docs/adr/0004-portability-posture.md) covers what a
-port costs.
+backend interface.
 
 **Does it leave anything behind?**
 One directory, `.devrun/`, beside your config: the log files, the control socket,
@@ -620,31 +598,8 @@ past it reads the file with `pread`. RSS does not follow log volume.
 
 **Migrating from 0.1?**
 0.2.0 reads `devrun.toml` and no longer reads the old YAML config. The move is
-mechanical, and `devrun config` names the devrun field for every old one it meets.
-The field-by-field map is under "Breaking: devrun has its own config" in the
-[CHANGELOG](CHANGELOG.md).
-
-## Design decisions
-
-The non-obvious choices are written down with the reasoning that produced them:
-
-- [Logs travel through the filesystem, not through the control socket](docs/adr/0001-logs-through-the-filesystem.md)
-- [Zig, not Rust](docs/adr/0003-zig-over-rust.md)
-- [Portability posture: portable by construction, Linux-only by scope](docs/adr/0004-portability-posture.md)
-- [Render log bytes straight through, rather than through a cell grid](docs/adr/0005-render-log-bytes-through.md)
-- [Every Session gets its own directory of Archives](docs/adr/0006-an-archive-per-session.md)
-- [Time lives beside the bytes, in a sidecar, not inside the Archive](docs/adr/0007-time-beside-the-bytes.md)
-- [devrun reads its own devrun.toml, and nothing else](docs/adr/0008-devrun-toml.md)
-
-[`CONTEXT.md`](CONTEXT.md) is the glossary (Worker, Group, Gate, Archive, Window).
-[`CHANGELOG.md`](CHANGELOG.md) says what changed for someone using devrun. Not
-done, deliberately: log search in the TUI, `liveness_probe`, and the reserved
-config fields `include` and `ready.tcp`.
+mechanical: `devrun config` names the devrun field for every old one it meets.
 
 ## Credits
 
 - **[mandor](https://github.com/asyafalni/mandor)** by Alfin Syafalni. A PID-1 container supervisor in Zig. Different shape, same problems; read closely, and borrowed from per-function with attribution.
-
-## License
-
-MIT. See [LICENSE](LICENSE).
