@@ -9,7 +9,7 @@
 [![platform](https://img.shields.io/badge/linux-x86__64%20%C2%B7%20aarch64-2b2b2b)](#install)
 [![binary](https://img.shields.io/badge/binary-0.6%20MB-2b2b2b)](#measured-against-process-compose)
 [![rss](https://img.shields.io/badge/idle%20RSS-1.2%20MB-2b2b2b)](#measured-against-process-compose)
-[![zig](https://img.shields.io/badge/zig-0.16-2b2b2b)](https://ziglang.org/download/#release-0.16.0)
+[![zig](https://img.shields.io/badge/zig-0.17-2b2b2b)](https://ziglang.org/download/#release-0.17.0)
 
 [Install](#install) · [Set it up for an agent](#two-commands-to-set-it-up) · [What the agent gets back](#the-four-questions-an-agent-can-now-ask) · [Token cost](#what-it-costs-to-read) · [The TUI](#for-the-human-at-the-keyboard) · [vs process-compose](#measured-against-process-compose)
 
@@ -17,7 +17,7 @@
 
 ---
 
-devrun starts every service in your repo's `process-compose.yaml`, keeps each
+devrun starts every service in your repo's `devrun.toml`, keeps each
 one's output in a plain file on disk, and answers questions about all of them in
 one command. Four commands are the whole interface:
 
@@ -29,7 +29,7 @@ $ devrun down             # stop everything
 ```
 
 **Status: working.** Spawns, supervises, archives, probes, draws, and answers
-questions about all of it. Linux only, Zig 0.16, one static binary, nothing to
+questions about all of it. Linux only, Zig 0.17, one static binary, nothing to
 fetch at runtime.
 
 ## Your agent is reading one log out of four
@@ -87,7 +87,7 @@ $ devrun version
 replaces whichever binary you invoked. A build in `~/src` and a release in
 `~/.local/bin` do not overwrite each other.
 
-**From source**, with [Zig 0.16.0](https://ziglang.org/download/#release-0.16.0):
+**From source**, with [Zig 0.17.0](https://ziglang.org/download/#release-0.17.0):
 
 ```console
 $ zig build && zig build test
@@ -112,8 +112,8 @@ however good the tool is. The block is four commands and the flags worth
 knowing, kept short on purpose: it lands in a file that is paid for on every
 single turn.
 
-If your repo has no `process-compose.yaml`, skip straight to
-[one command, no config file](#one-command-no-config-file). devrun still works.
+No `devrun.toml` yet? Write one in a minute from [the config](#the-config), or
+skip it entirely with [one command, no config file](#one-command-no-config-file).
 
 ## The four questions an agent can now ask
 
@@ -331,6 +331,10 @@ Piped or redirected, `up` prints prefixed lines instead of drawing, so
 ```console
 $ devrun up                    # TUI
 $ devrun up --detach           # background; returns once everything is ready
+$ devrun up api web            # only these and what they depend on; the rest are off
+$ devrun up --profile e2e      # a named set of services, from [profiles.e2e]
+$ devrun up api --no-deps      # only api; a dependency that is not running counts as satisfied
+$ devrun start worker          # start an off service later, with its off dependencies
 $ devrun run pnpm dev          # one command, no config file needed
 $ devrun up --plain            # prefixed lines, no terminal control
 $ devrun up --window-bytes 8M  # a larger in-memory cache; the log is unaffected
@@ -352,8 +356,8 @@ Run `devrun` with no arguments for every flag.
 
 ## One command, no config file
 
-Most repos do not have a `process-compose.yaml`. Until `devrun run`, those were
-repos where devrun did nothing at all.
+Not every repo needs a config file. `devrun run` gives a single command
+everything a configured service gets.
 
 ```console
 $ devrun run pnpm dev
@@ -386,65 +390,239 @@ collide with every subcommand devrun has and every one it might grow: add a
 `devrun test` later and `devrun test ./...` silently stops running your tests.
 That is the same class of mistake the config loader refuses to make.
 
-## It reads the config you already have
+## The config
 
-devrun reads your existing `process-compose.yaml`. No second config file,
-nothing to keep in sync, and a teammate can keep running
-[process-compose](https://github.com/F1bonacc1/process-compose) against the same
-file.
+One file, `devrun.toml`, beside where you run devrun. The smallest one is two
+lines:
 
-It supports a strict subset of the schema and **refuses any field it does not
-understand** rather than ignoring it. That refusal is deliberate: a silently
-skipped field is how two people run the same file and get different behaviour
-with nothing on screen to say why.
+```toml
+[services.web]
+run = "pnpm dev"
+```
+
+A real one, with a database, a migration that has to finish first, an API with
+a health check, and a worker that counts as up once it says so:
+
+```toml
+env_file = ".env"                 # every service gets it
+
+[env]                             # so does this
+DATABASE_URL = "postgres://dev:dev@localhost:5432/app"
+
+[templates.node]                  # shared settings, taken with `extends`
+restart = { policy = "on-failure", max = 5, backoff = "1s" }
+stop    = { signal = "INT", timeout = "15s" }
+
+[profiles.e2e]                    # `devrun up --profile e2e`
+services = ["e2e"]                # plus everything it depends on
+env      = { BASE_URL = "http://localhost:3000" }
+
+[services.postgres]
+run   = ["docker", "run", "--rm", "-p", "5432:5432",
+         "-e", "POSTGRES_PASSWORD=dev", "postgres:16"]
+ready = { exec = "pg_isready -h localhost", every = "2s", failures = 30 }
+
+[services.migrate]
+run   = "pnpm db:migrate"
+after = ["postgres"]              # waits for postgres to be ready
+
+[services.api]
+extends = "node"
+run     = "pnpm dev"
+cwd     = "apps/api"
+env     = { PORT = 3000 }
+after   = { migrate = "succeeded" }
+ready   = "http://localhost:3000/health"
+watch   = ["src"]                 # a change restarts it
+
+[services.worker]
+extends  = "node"
+run      = "pnpm worker"
+after    = ["api"]
+ready    = { log = "worker started" }
+replicas = 2                      # worker.1 and worker.2
+
+[services.e2e]
+run       = "pnpm test:e2e"
+after     = { api = "ready" }
+autostart = false                 # not part of a plain `devrun up`
+restart   = "exit-on-end"         # when the suite ends, so does the Session
+```
+
+`devrun config` prints what devrun understood from the file, and is worth
+running on its own after an edit.
+
+**Any field devrun does not know is refused, not ignored.** A typo in a field
+name would otherwise give you a service that quietly behaves differently, with
+nothing on screen to say why. Names you might bring from another runner get the
+devrun name back:
 
 ```console
 $ devrun config
-devrun: processes.go: unsupported field "log_location". devrun reads a subset of
-process-compose's schema and refuses fields it would otherwise ignore, so that
-both tools read this file the same way.
+devrun: services.api: unknown field "command". devrun calls it "run"
 ```
 
 <details>
-<summary><b>The supported subset, field by field</b></summary>
+<summary><b>Every field</b></summary>
 
-| | |
+| Top level | |
 |---|---|
-| Top level | `version` (ignored), `shell.shell_command`, `shell.shell_argument` |
-| Process | `command`, `description`, `working_dir`, `dotenv`, `environment`, `ready_log_line` |
-| Dependencies | `depends_on.<name>.condition`, all five conditions |
-| Restart | `availability.restart`: `no`, `always`, `on_failure`, `exit_on_failure` |
-| Probes | `readiness_probe.exec.command`, `readiness_probe.http_get.{host,scheme,path,port}` |
-| Probe timing | `initial_delay_seconds`, `period_seconds`, `timeout_seconds`, `success_threshold`, `failure_threshold` |
-| Shutdown | `shutdown.signal`, `shutdown.timeout_seconds` |
+| `[services.<name>]` | Required. One table per service, shown in file order. Names use letters, digits, `-`, `_` and `.` |
+| `[templates.<name>]` | Any service fields, taken by a service with `extends = "<name>"` |
+| `[profiles.<name>]` | `services = ["api", "e2e"]` and optionally `env = { ... }`. `devrun up --profile <name>` starts those services and what they depend on, with that `env` layered over `[env]` |
+| `[env]` | Variables every service gets |
+| `env_file` | A file or a list of files every service reads, relative to the config |
+| `shell` | What runs each command. Default `["bash", "-c"]` |
+| `color` | Default `true`. Services get `FORCE_COLOR=1` and `CLICOLOR_FORCE=1`, so tools keep their colour when writing into a pipe. `false` turns it off |
 
-`${VAR}` and `$VAR` expand over the raw file *before* YAML parsing, with `.env`
-values taking precedence over the OS environment and unset names becoming empty.
-That matches process-compose exactly. Shell parameter expansion
-(`${VAR:-default}`) is rejected, as it is there. Omitted fields take
-process-compose's defaults rather than zero: probes default to
-`period_seconds: 10`, `timeout_seconds: 1`, `failure_threshold: 3`, and
-`shutdown` to SIGTERM with a 10-second grace.
+| Service | |
+|---|---|
+| `run` | Required. A string for the shell, or an array of words devrun quotes for it |
+| `description` | Shown by `devrun config` |
+| `cwd` | Working directory, relative to the config |
+| `env` | `{ KEY = "value" }`. Numbers and booleans are written out as text |
+| `env_file` | A file or a list of files |
+| `after` | `["db"]`, or `{ db = "ready" }`. Conditions: `started`, `ready`, `exited`, `succeeded` |
+| `autostart` | `false` keeps it out of a plain `devrun up` (it shows as `off`), unless a service that is started depends on it. `devrun start NAME` starts it later |
+| `replicas` | `1` to `64`. N instances named `<name>.1` to `<name>.N`, each with `DEVRUN_REPLICA=<k>` in its environment. See below |
+| `watch` | `["src", "go.mod"]` or `{ paths = [...], ignore = [...], debounce = "300ms" }`. A change restarts the service. See below |
+| `restart` | `"no"` (default), `"always"`, `"on-failure"`, `"exit-on-failure"`, `"exit-on-end"`, or a table: `{ policy = "on-failure", max = 5, backoff = "1s" }`. See below |
+| `ready` | One of `http`, `exec` or `log`. See below |
+| `stop` | `{ signal = "INT", timeout = "15s" }`. Default `TERM`, 10 s, then `KILL`. `command` runs a cleanup step first. See below |
+| `extends` | The name of a template |
 
-Two limits are ours rather than process-compose's. `readiness_probe.http_get`
-speaks plain HTTP only (`scheme: https` is refused, not silently downgraded),
-and its `host` must be an IP literal or `localhost`, because a name lookup in
-the event loop is a blocking call wearing a disguise.
+| `restart` table | |
+|---|---|
+| `policy` | The same names as the string form. `max` and `backoff` are only allowed with `always` or `on-failure` |
+| `backoff` | Wait before the first restart, doubling each time up to 30 s (or the backoff itself, if that is longer). Default `200ms` |
+| `max` | Give up after this many restarts in a row. The service is left `failed`, so `devrun errors` reports it. A run that stayed up at least 30 seconds resets the count |
+
+| `stop` | |
+|---|---|
+| `signal` | Default `TERM` |
+| `timeout` | Bounds the whole stop, command included, before `KILL`. Default 10 s |
+| `command` | A string or an array, run with the service's env and cwd. See below |
+
+| `watch` table | |
+|---|---|
+| `paths` | Relative to the service's `cwd`. Directories are watched recursively |
+| `ignore` | Names to skip, added to the defaults. `*` is a wildcard |
+| `debounce` | Quiet time before a change counts, such as `"300ms"` |
+
+| `ready` | |
+|---|---|
+| `http` | `"http://host:port/path"`. Plain HTTP; the host is an IP address or `localhost` |
+| `status` | With `http` only. The exact status the check expects, such as `204`. Default: any 2xx or 3xx |
+| `exec` | A command. Exit 0 is a pass |
+| `log` | Text that, once it appears in the output, means ready |
+| `delay`, `every`, `timeout` | Durations for `http` and `exec`, in whole seconds: `5`, `"5s"`, `"2m"`. Defaults 0, 10 s, 1 s |
+| `successes`, `failures` | Passes in a row to count as ready (1), failures in a row to report it unhealthy (3) |
+
+`ready = "http://..."` is the short form of `ready = { http = "..." }`.
+
+`after = ["db"]` waits for `db` to be ready if it has a `ready` check, and for it
+to have started if not. A service extending a template overrides it field by
+field; `env` and `env_file` add up, and `stop` merges its two fields separately.
+
+**Variables.** `${VAR}`, `$VAR` and `${VAR:-default}` expand in `env`,
+`env_file`, `cwd` and `ready.http`, looking in the top-level `[env]`, then the
+top-level `env_file`, then the environment devrun started in. `$$` is a dollar
+sign. `run` and `ready.exec` are not expanded by devrun: they go to the shell as
+written, with the service's environment, so `awk '{print $NF}'` works.
+
+**Layering.** Each service's environment is the one devrun started in, then
+every `env_file` in order, then every `env` entry. `env` always beats
+`env_file`.
+
+**Durations.** Probe timings (`delay`, `every`, `timeout`) and `stop.timeout`
+are whole seconds: `5`, `"5s"`, `"2m"`. `backoff` and `debounce` also take
+milliseconds, such as `"300ms"`.
+
+**Replicas.** `replicas = 3` on `worker` makes `worker.1`, `worker.2` and
+`worker.3`. They are expanded when the config is built, not at run time, so
+each one has its own `DEVRUN_REPLICA` (`1`, `2`, `3`) in its environment and
+`${DEVRUN_REPLICA}` works in `env`, `env_file`, `cwd` and `ready.http`:
+
+```toml
+[services.worker]
+run      = "pnpm worker"
+replicas = 3
+env      = { PORT = "300${DEVRUN_REPLICA}" }
+ready    = "http://127.0.0.1:300${DEVRUN_REPLICA}/health"
+```
+
+Each replica writes its own Archive, `.devrun/logs/latest/worker.2.log`.
+`after = ["worker"]` waits for every replica; `after = ["worker.2"]` names one.
+On the command line the service name means all of its replicas:
+`devrun logs worker`, `devrun restart worker`.
+
+**Profiles and `off`.** A plain `devrun up` starts every service except those
+with `autostart = false`. `devrun up --profile e2e` starts the profile's
+`services` and what they depend on, and layers the profile's `env` over the
+top-level `[env]`. `devrun up api web` does the same for the names you give.
+Whatever was left out is `off`: not part of this run, and not a failure.
+`devrun wait` counts it as settled and `devrun errors` does not report it.
+`devrun start NAME` brings one in later, together with its own dependencies
+that are off. `--no-deps` starts only the names you gave, and a dependency that
+is not running is treated as satisfied.
+
+**Restart limits and `exit-on-end`.** `restart = "exit-on-end"` is for "start
+the stack, run the suite, tear it all down" in one command: when that service
+ends on its own, the whole Session shuts down and devrun exits with that
+service's exit status. With `after = { api = "ready" }` on the suite, the suite
+only starts once the API is up. `max` in the table form is what stops a service
+that crashes on boot from restarting forever.
+
+**Stop commands.** `stop.command = "docker compose down"` runs whenever the
+service is stopped: `devrun stop`, `down`, Ctrl-C, the end of the Session. It
+gets the service's env and cwd. If the service is still running when the
+command finishes, it then gets `stop.signal`, and `stop.timeout` bounds the
+whole thing before `KILL`. It also runs for a service that already exited, as
+long as it started this Session. That is what lets a daemonising command like
+`docker compose up -d` clean up after itself, since the process devrun spawned
+is long gone by the time anyone asks it to stop. Once the service's own output
+pipe has closed, the command's output goes into that service's log.
+
+**Watching.** `watch = ["src", "go.mod"]` restarts the service when something
+under those paths changes, or starts it again if it had exited or failed. Paths
+are relative to the service's `cwd`, and directories are watched recursively.
+Ignored by default (a name you add under `ignore` adds to these): `.git`,
+`.devrun`, `node_modules`, `__pycache__`, `.venv`, `.zig-cache`, `zig-out`,
+`*.swp`, `*.swx`, `*~`, `4913` and `.#*`. A pattern matches a file or directory
+name, and `*` is a wildcard. It uses Linux inotify; a path that cannot be
+watched is reported when the Session starts.
+
+**Colour.** A service writing into devrun's pipe is not talking to a terminal,
+so most tools turn their colour off. devrun sets `FORCE_COLOR=1` and
+`CLICOLOR_FORCE=1` so they do not. It does not when `NO_COLOR` is set anywhere
+in the service's environment, or with `color = false`, and a value you set in
+`env` always wins. Colour costs an agent nothing: `devrun logs` strips escapes
+unless you pass `--raw`.
+
+**Local overrides.** If `devrun.local.toml` sits beside `devrun.toml` (for
+`-f path/x.toml`, it is `path/x.local.toml`), it is merged over it: tables merge
+key by key, anything else replaces. That is for the things that are yours and
+should not be committed, such as a port that clashes on your machine or a token
+in `env`. Add it to `.gitignore`. `devrun config` says when it merged one.
+
+**Reserved.** `include` and `ready.tcp` are planned. Using one today gets a
+message saying so rather than an unknown-field error.
 
 </details>
 
-A config is also refused when its graph could never resolve: a `depends_on`
-cycle, a `process_healthy` wait on a process with no probe, or a
-`process_log_ready` wait on one with no `ready_log_line`. Each of those would
-otherwise hang the Session with nothing on screen to say why.
+A config is also refused when its graph could never resolve: an `after` cycle,
+a wait for `ready` on a service with no `ready` check, or a wait on a service
+that does not exist. Each of those would otherwise hang the Session with nothing
+on screen to say why.
 
-Beyond the config, devrun runs the graph: all five `depends_on` conditions,
-readiness probes over `exec` and `http_get`, the four restart policies, and a
-shutdown ladder that honours the signal and grace period the file asks for.
+The file is [TOML](https://toml.io/en/v1.0.0), because it has comments, no
+significant indentation, and no `no` that quietly turns into `false`. Why the
+schema looks the way it does is in
+[ADR 0008](docs/adr/0008-devrun-toml.md).
 
 ## Measured against process-compose
 
-Both runners were given the **same `process-compose.yaml`**, started in a pty of
+Both runners were given **the same four services**, started in a pty of
 the same size (160×40), and left to settle for four seconds before a
 twenty-second measurement window. What is measured is the **supervisor's own**
 CPU and RSS, meaning `utime + stime` and resident pages of that one process, not
@@ -476,16 +654,19 @@ screen is current, but on a thin SSH link it is bandwidth you are spending.
 
 Read the rest of the table with the scope in mind. process-compose is
 cross-platform, has a REST API, a far larger config surface, and years of edge
-cases devrun has not met yet. devrun reads a strict subset of one file on one
-OS. It *should* be cheaper. The point of measuring was to check that it actually
+cases devrun has not met yet. devrun has a small config and runs on one OS. It *should* be cheaper. The point of measuring was to check that it actually
 is, and by how much. To repeat any of this: the harness is a `pty.fork`, a fixed
 `TIOCSWINSZ`, and `/proc/<pid>/stat` sampled at both ends of the window.
 
 ## Questions people ask
 
-**Does this replace process-compose?**
-No. It reads its config file and runs a strict subset of it, on Linux, cheaply.
-A teammate on macOS keeps running process-compose against the same file.
+**Can it read my process-compose.yaml?**
+No. devrun has its own config, and the two files do not mix. Moving one over is
+mechanical: `processes` becomes `services`, `command` becomes `run`,
+`depends_on` becomes `after`, `readiness_probe` and `ready_log_line` become
+`ready`. `devrun config` names the devrun field for every old one it meets.
+devrun now covers replicas, profiles, file watching, restart limits and
+exit-on-end too, though process-compose still has the larger surface.
 
 **Why is there no MCP server?**
 Every coding agent already has a shell, and
@@ -516,12 +697,13 @@ scrolling past it reads the file with `pread`. RSS does not follow log volume.
 Everything in the original plan is done: config, spawn and shutdown ladder,
 Archive and Window, state machine and probes, control socket, TUI, copy, and
 per-process sampling. Not done, and deliberately so: log search in the TUI,
-`liveness_probe`, and anything that would put a second config file in the repo.
+`liveness_probe`, and the two reserved config fields, `include` and
+`ready.tcp`, listed under [the config](#the-config).
 
 The non-obvious choices are written down with the reasoning that produced them:
 
 - [Logs travel through the filesystem, not the control socket](docs/adr/0001-logs-through-the-filesystem.md)
-- [Read process-compose.yaml rather than defining our own format](docs/adr/0002-read-process-compose-yaml.md)
+- [devrun reads its own devrun.toml, and nothing else](docs/adr/0008-devrun-toml.md). Supersedes [0002](docs/adr/0002-read-process-compose-yaml.md), which read process-compose.yaml.
 - [Zig, not Rust](docs/adr/0003-zig-over-rust.md). The score was near-even, and the tiebreaker was not technical.
 - [Portable by construction, Linux-only by scope](docs/adr/0004-portability-posture.md)
 - [Render log bytes straight through, not through a cell grid](docs/adr/0005-render-log-bytes-through.md). Why the TUI is hand-written, against 0003.
@@ -534,9 +716,8 @@ Archive, and a Window each mean here, and which words are deliberately avoided.
 
 ## Credits
 
-- **[process-compose](https://github.com/F1bonacc1/process-compose)** by Eugene Berger. The tool this starts from, and whose config file it reads.
+- **[process-compose](https://github.com/F1bonacc1/process-compose)** by Eugene Berger. The tool this started from.
 - **[mandor](https://github.com/asyafalni/mandor)** by Alfin Syafalni. A PID-1 container supervisor in Zig. Different shape, same problems; read closely, and borrowed from per-function with attribution.
-- **[zig-yaml](https://github.com/kubkon/zig-yaml)** by Jakub Konka. Vendored under `src/vendor/yaml`, and the only dependency. See its [PROVENANCE.md](src/vendor/yaml/PROVENANCE.md) for why it is vendored and what is patched.
 
 ## License
 

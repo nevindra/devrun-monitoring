@@ -19,22 +19,12 @@ const store = @import("store.zig");
 /// or from `devrun clean`.
 const humanBytes = tui.humanBytes;
 
-/// The vendored YAML parser logs every token it sees at `.debug`, which in a
-/// Debug build buries anything we print. Its warnings are still worth having.
-/// These are all three scopes it uses; re-check after re-syncing the vendor.
-pub const std_options: std.Options = .{
-    .log_scope_levels = &.{
-        .{ .scope = .yaml, .level = .warn },
-        .{ .scope = .parser, .level = .warn },
-        .{ .scope = .tokenizer, .level = .warn },
-    },
-};
-
 const usage =
     \\devrun — process runner for local development
     \\
     \\Usage:
-    \\  devrun up [--detach]            Start every process and supervise them
+    \\  devrun up [NAME...] [--detach] Start every process, or just NAME and what it
+    \\                                  needs, and supervise them
     \\  devrun run CMD...               Supervise one command, with no config file
     \\  devrun down                     Shut a running Session down
     \\  devrun wait [--timeout D]       Block until everything is ready, or fail
@@ -64,7 +54,8 @@ const usage =
     \\Options for `run` (they go before the command):
     \\  --name NAME        What to call it (default: the program's name)
     \\  --cwd DIR          Working directory
-    \\  --restart POLICY   no, always, on_failure, exit_on_failure (default: no)
+    \\  --restart POLICY   no, always, on-failure, exit-on-failure, exit-on-end
+    \\                     (default: no)
     \\  --ready-log TEXT   Count it ready once this appears in its output
     \\  --shell            Let the shell split the words, for `--shell 'a; b'`
     \\
@@ -72,8 +63,13 @@ const usage =
     \\passed through untouched, so `devrun run pnpm dev --json` gives --json to
     \\pnpm. Use `--` first if the command's own name starts with a dash.
     \\
+    \\Options for `up`:
+    \\  --profile P        Start the services of [profiles.P] and what they need
+    \\  --no-deps          Start only the NAMEs given; a dependency that is off
+    \\                     counts as satisfied
+    \\
     \\Other options:
-    \\  -f FILE            Config to read (default: process-compose.yaml)
+    \\  -f FILE            Config to read (default: devrun.toml)
     \\  --plain            Never draw the TUI, even on a terminal
     \\  --detach, -d       Run the Session in the background and return once
     \\                     every process is ready
@@ -129,7 +125,7 @@ pub fn main(init: std.process.Init) !u8 {
             ),
             error.BadRestart => try err(
                 io,
-                "devrun: --restart takes no, always, on_failure, or exit_on_failure\n",
+                "devrun: --restart takes no, always, on-failure, exit-on-failure, or exit-on-end\n",
                 .{},
             ),
             error.UnknownFlag => try err(
@@ -144,12 +140,12 @@ pub fn main(init: std.process.Init) !u8 {
 
     const cmd = args[1];
     if (std.mem.eql(u8, cmd, "config")) {
-        // `devrun config path.yaml` reads more naturally than -f here, and is
+        // `devrun config path.toml` reads more naturally than -f here, and is
         // what the README has always shown.
         if (rest.len > 0) cli.path = rest[0];
         return cli.dumpConfig(out);
     }
-    if (std.mem.eql(u8, cmd, "up")) return cli.up(out);
+    if (std.mem.eql(u8, cmd, "up")) return cli.up(out, rest);
     if (std.mem.eql(u8, cmd, "run")) {
         if (rest.len == 0) {
             try err(io, "devrun: run needs a command, like `devrun run pnpm dev`\n", .{});
@@ -194,7 +190,7 @@ const Cli = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     environ: *const std.process.Environ.Map,
-    path: []const u8 = "process-compose.yaml",
+    path: []const u8 = config.default_path,
     force_plain: bool = false,
     /// Zero means "whatever the Supervisor's default is", so the default lives
     /// in one place rather than being restated here.
@@ -204,6 +200,10 @@ const Cli = struct {
     keep: usize = default_keep,
 
     detach: bool = false,
+    /// `up`: the `[profiles.<name>]` to start, and whether to leave a
+    /// selected service's dependencies out.
+    profile: ?[]const u8 = null,
+    no_deps: bool = false,
     timeout_ms: u64 = 2 * 60 * 1000,
 
     // `run`.
@@ -295,8 +295,13 @@ const Cli = struct {
             } else if (std.mem.eql(u8, a, "--restart")) {
                 i += 1;
                 if (i >= args.len) return error.MissingValue;
-                self.restart = std.meta.stringToEnum(config.Restart, args[i]) orelse
-                    return error.BadRestart;
+                self.restart = parseRestartFlag(args[i]) orelse return error.BadRestart;
+            } else if (std.mem.eql(u8, a, "--profile")) {
+                i += 1;
+                if (i >= args.len) return error.MissingValue;
+                self.profile = args[i];
+            } else if (std.mem.eql(u8, a, "--no-deps")) {
+                self.no_deps = true;
             } else if (std.mem.eql(u8, a, "--shell")) {
                 self.shell_mode = true;
             } else if (std.mem.eql(u8, a, "--plain")) {
@@ -411,6 +416,7 @@ const Cli = struct {
         return config.load(self.gpa, self.path, .{
             .io = self.io,
             .environ = self.environ,
+            .profile = self.profile,
         }, diag);
     }
 
@@ -432,34 +438,58 @@ const Cli = struct {
         var cfg = self.load(&diag) catch |e| return self.reportLoadFailure(diag, e);
         defer cfg.deinit();
 
-        try out.print("shell: {s} {s}\n\n", .{ cfg.shell.command, cfg.shell.argument });
+        try out.print("shell: {s} {s}\n", .{ cfg.shell.command, cfg.shell.argument });
+        if (cfg.local_path) |p| try out.print("merged: {s}\n", .{p});
+        for (cfg.profiles) |prof| {
+            const active = cfg.active_profile != null and
+                std.mem.eql(u8, cfg.active_profile.?, prof.name);
+            try out.print("profile: {s}{s} (", .{ prof.name, if (active) " [active]" else "" });
+            for (prof.services, 0..) |svc, i| try out.print("{s}{s}", .{ if (i > 0) ", " else "", svc });
+            try out.writeAll(")\n");
+        }
+        try out.writeAll("\n");
         for (cfg.workers) |w| {
             try out.print("{s}\n", .{w.name});
-            if (w.description) |d| try out.print("  description   {s}\n", .{d});
-            try out.print("  command       {s}\n", .{w.command});
-            if (w.working_dir) |d| try out.print("  working_dir   {s}\n", .{d});
-            try out.print("  restart       {t}\n", .{w.restart});
-            try out.print("  shutdown      signal {d}, {d}s grace\n", .{
-                w.shutdown.signal,
-                w.shutdown.timeout_seconds,
-            });
-            for (w.dotenv) |f| try out.print("  dotenv        {s}\n", .{f});
-            for (w.environment) |e| try out.print("  env           {s}\n", .{e});
-            for (w.depends_on) |d| {
-                try out.print("  depends_on    {s} ({t})\n", .{ d.name, d.condition });
+            if (w.description) |d| try out.print("  description  {s}\n", .{d});
+            try out.print("  run          {s}\n", .{w.command});
+            if (w.working_dir) |d| try out.print("  cwd          {s}\n", .{d});
+            if (!w.autostart) try out.writeAll("  autostart    no\n");
+            try out.print("  restart      {s}", .{w.restart.label()});
+            if (w.restart_max > 0) try out.print(", max {d}", .{w.restart_max});
+            if (w.restart_backoff_ms != 200) try out.print(", backoff {d}ms", .{w.restart_backoff_ms});
+            try out.writeAll("\n");
+            if (config.signalName(w.shutdown.signal)) |name| {
+                try out.print("  stop         SIG{s}, {d}s grace\n", .{ name, w.shutdown.timeout_seconds });
+            } else {
+                try out.print("  stop         signal {d}, {d}s grace\n", .{ w.shutdown.signal, w.shutdown.timeout_seconds });
             }
-            if (w.ready_log_line) |l| try out.print("  log ready     \"{s}\"\n", .{l});
+            if (w.shutdown.command) |c| try out.print("  stop command {s}\n", .{c});
+            if (w.watch) |wt| {
+                try out.writeAll("  watch        ");
+                for (wt.paths, 0..) |path, i| try out.print("{s}{s}", .{ if (i > 0) ", " else "", path });
+                try out.print(" (debounce {d}ms)\n", .{wt.debounce_ms});
+            }
+            for (w.env_file) |f| try out.print("  env_file     {s}\n", .{f});
+            for (w.env) |e| try out.print("  env          {s}\n", .{e});
+            for (w.depends_on) |d| {
+                try out.print("  after        {s} ({t})\n", .{ d.name, d.condition });
+            }
+            if (w.ready_log_line) |l| try out.print("  ready log    \"{s}\"\n", .{l});
             if (w.readiness_probe) |p| {
                 switch (p.target) {
-                    .exec => |c| try out.print("  probe exec    {s}\n", .{c}),
-                    .http_get => |h| try out.print(
-                        "  probe http    {s}://{s}:{d}{s}\n",
-                        .{ h.scheme, h.host, h.port, h.path },
-                    ),
+                    .exec => |c| try out.print("  ready exec   {s}\n", .{c}),
+                    .http_get => |h| {
+                        try out.print(
+                            "  ready http   {s}://{s}:{d}{s}",
+                            .{ h.scheme, h.host, h.port, h.path },
+                        );
+                        if (h.status) |code| try out.print(" status {d}", .{code});
+                        try out.writeAll("\n");
+                    },
                 }
                 try out.print(
-                    "                delay={d}s period={d}s timeout={d}s failures={d}\n",
-                    .{ p.initial_delay_seconds, p.period_seconds, p.timeout_seconds, p.failure_threshold },
+                    "               delay={d}s every={d}s timeout={d}s successes={d} failures={d}\n",
+                    .{ p.initial_delay_seconds, p.period_seconds, p.timeout_seconds, p.success_threshold, p.failure_threshold },
                 );
             }
             try out.writeAll("\n");
@@ -483,9 +513,10 @@ const Cli = struct {
 
         const known = self.knownWorkers(dir) catch |e| {
             switch (e) {
-                error.NoWorkers => try err(self.io,
+                error.NoWorkers => try err(
+                    self.io,
                     "devrun: nothing to show. No config here, no Session running,\n" ++
-                    "        and no logs in {s}.\n",
+                        "        and no logs in {s}.\n",
                     .{dir},
                 ),
                 else => try err(self.io, "devrun: cannot list processes: {t}\n", .{e}),
@@ -530,10 +561,21 @@ const Cli = struct {
     /// a service is quiet when it is actually misspelled.
     fn select(self: Cli, known: []const []const u8, names: []const []const u8) ![][]const u8 {
         if (names.len == 0) return self.gpa.dupe([]const u8, known);
+        var picked: std.ArrayList([]const u8) = .empty;
+        errdefer picked.deinit(self.gpa);
         for (names) |name| {
+            const before = picked.items.len;
+            // A service name means its replicas: `worker` is `worker.1` to
+            // `worker.N`. That holds without a config too, where the names
+            // come from the log directory and only the `.<digits>` shows it.
             for (known) |k| {
+                if (!std.mem.eql(u8, k, name) and !isReplicaOf(k, name)) continue;
+                for (picked.items) |already| {
+                    if (std.mem.eql(u8, already, k)) break;
+                } else try picked.append(self.gpa, k);
                 if (std.mem.eql(u8, k, name)) break;
-            } else {
+            }
+            if (picked.items.len == before and !alreadyPicked(picked.items, name, known)) {
                 try err(self.io, "devrun: \"{s}\" is not a process here.\n", .{name});
                 try err(self.io, "        Known: ", .{});
                 for (known, 0..) |k, i| {
@@ -543,7 +585,7 @@ const Cli = struct {
                 return error.NoSuchWorker;
             }
         }
-        return self.gpa.dupe([]const u8, names);
+        return picked.toOwnedSlice(self.gpa);
     }
 
     /// Every Worker this directory knows about, from whichever source can
@@ -595,7 +637,7 @@ const Cli = struct {
             if (names.items.len > 0) return names.toOwnedSlice(self.gpa);
         }
 
-        const dir_z = try self.gpa.dupeZ(u8, log_dir);
+        const dir_z = try self.gpa.dupeSentinel(u8, log_dir, 0);
         defer self.gpa.free(dir_z);
         var it = os.DirIter.open(dir_z.ptr) catch return error.NoWorkers;
         defer it.close();
@@ -750,9 +792,10 @@ const Cli = struct {
         if (self.all) {
             var probe_buf: [4096]u8 = undefined;
             if (control.ask(dirs.sock, "status\n", &probe_buf)) |_| {
-                try err(self.io,
+                try err(
+                    self.io,
                     "devrun: a Session is running here — its logs are being written to.\n" ++
-                    "        Stop it first, or run `devrun clean` to keep just that one.\n",
+                        "        Stop it first, or run `devrun clean` to keep just that one.\n",
                     .{},
                 );
                 return 1;
@@ -867,11 +910,16 @@ const Cli = struct {
 
     // ----------------------------------------------------------- up
 
-    fn up(self: Cli, out: *std.Io.Writer) !u8 {
+    fn up(self: Cli, out: *std.Io.Writer, names: []const []const u8) !u8 {
         var diag: config.Diagnostic = .{};
         defer diag.deinit(self.gpa);
         var cfg = self.load(&diag) catch |e| return self.reportLoadFailure(diag, e);
         defer cfg.deinit();
+
+        // Before any fork: a name that matches nothing is an error on the
+        // terminal that typed it, and the choice survives `--detach`.
+        config.select(&cfg, .{ .names = names, .no_deps = self.no_deps }, self.gpa, &diag) catch |e|
+            return self.reportLoadFailure(diag, e);
         return self.supervise(out, &cfg, null);
     }
 
@@ -879,7 +927,7 @@ const Cli = struct {
     ///
     /// The point is not to add a feature to the Session, it is to remove the
     /// config file as an entry requirement. Most repos do not have a
-    /// `process-compose.yaml`, and until now that meant devrun did nothing at
+    /// `devrun.toml`, and until now that meant devrun did nothing at
     /// all in them. `devrun run pnpm dev` gets the Archive, the Index, and
     /// therefore `devrun logs`, `errors`, `wait` and `--detach` in any repo.
     fn runCommand(self: Cli, out: *std.Io.Writer, argv: []const []const u8) !u8 {
@@ -940,7 +988,8 @@ const Cli = struct {
                     var reply_buf: [64 << 10]u8 = undefined;
                     const outcome = self.pollUntilSettled(&reply_buf, pid);
                     if (outcome == .no_session) {
-                        try err(self.io,
+                        try err(
+                            self.io,
                             "devrun: the Session did not come up. {s} has why.\n",
                             .{dirs.session_log},
                         );
@@ -1001,9 +1050,10 @@ const Cli = struct {
         // start anything.
         var server = control.Server.open(dirs.sock) catch |e| switch (e) {
             error.SessionAlreadyRunning => {
-                try err(self.io,
+                try err(
+                    self.io,
                     "devrun: a Session is already running here ({s}).\n" ++
-                    "        Stop it first, or run from another directory.\n",
+                        "        Stop it first, or run from another directory.\n",
                     .{dirs.sock},
                 );
                 return 1;
@@ -1099,15 +1149,39 @@ const Cli = struct {
         defer dirs.deinit(self.gpa);
 
         return control.ask(dirs.sock, line, buf) catch |e| {
-            try err(self.io,
+            try err(
+                self.io,
                 "devrun: no Session is running here (no {s}).\n" ++
-                "        Start one with `devrun up --detach`.\n",
+                    "        Start one with `devrun up --detach`.\n",
                 .{dirs.sock},
             );
             return e;
         };
     }
 };
+
+/// `worker.2` is a replica of `worker`.
+fn isReplicaOf(candidate: []const u8, name: []const u8) bool {
+    if (candidate.len <= name.len + 1) return false;
+    if (!std.mem.startsWith(u8, candidate, name) or candidate[name.len] != '.') return false;
+    for (candidate[name.len + 1 ..]) |c| {
+        if (c < '0' or c > '9') return false;
+    }
+    return true;
+}
+
+/// Whether `name` was already satisfied by an earlier argument: asking for
+/// `worker` and then `worker.1` finds nothing new the second time, and that
+/// is not a misspelling.
+fn alreadyPicked(picked: []const []const u8, name: []const u8, known: []const []const u8) bool {
+    for (picked) |p| {
+        if (std.mem.eql(u8, p, name)) return true;
+    }
+    for (known) |k| {
+        if (std.mem.eql(u8, k, name)) return true;
+    }
+    return false;
+}
 
 fn freeNames(gpa: std.mem.Allocator, names: [][]const u8) void {
     for (names) |n| gpa.free(n);
@@ -1142,6 +1216,17 @@ fn parseSize(text: []const u8) ?usize {
     return std.math.shlExact(usize, n, shift) catch null;
 }
 
+/// `--restart` takes the config's spelling, and the underscore one too: a
+/// flag typed from memory should not fail over a dash.
+fn parseRestartFlag(text: []const u8) ?config.Restart {
+    var buf: [32]u8 = undefined;
+    if (text.len > buf.len) return null;
+    const dashed = buf[0..text.len];
+    @memcpy(dashed, text);
+    std.mem.replaceScalar(u8, dashed, '_', '-');
+    return config.Restart.parse(dashed);
+}
+
 const log_dir_suffix = ".devrun/logs";
 
 const begin_marker = "<!-- devrun:begin -->";
@@ -1155,7 +1240,7 @@ const agent_doc = begin_marker ++
     \\
     \\## Running this project's services
     \\
-    \\`devrun` runs every service in `process-compose.yaml` at once and keeps
+    \\`devrun` runs every service in `devrun.toml` at once and keeps
     \\each one's output in a plain file under `.devrun/logs/latest/`. Prefer it over
     \\running a single dev server in the background: with one server you only
     \\see that server's output, and the error is usually in another one.
@@ -1167,7 +1252,7 @@ const agent_doc = begin_marker ++
     \\$ devrun down             # stop everything
     \\```
     \\
-    \\With no `process-compose.yaml`, supervise one command instead. The same
+    \\With no `devrun.toml`, supervise one command instead. The same
     \\`logs`, `errors` and `down` work against it.
     \\
     \\```console
@@ -1176,6 +1261,8 @@ const agent_doc = begin_marker ++
     \\
     \\`devrun run` exits with the command's own exit status. Its words pass
     \\through untouched, so devrun's flags go before the command.
+    \\
+    \\`devrun up NAME` starts just that service and what it depends on.
     \\
     \\`devrun up --detach` exits non-zero if a service fails to come up, and
     \\`devrun errors` exits non-zero while anything is broken, so both can be
@@ -1254,26 +1341,35 @@ fn runPlain(
         });
     }
 
-    while (!sup.done()) {
-        var extra: [control.Server.max_poll_fds]os.PollFd = undefined;
-        const n = if (server) |s| s.fillPollFds(&extra) else 0;
-        try sup.step(extra[0..n], 200);
-        if (server) |s| s.service(extra[0..n], sup);
-        try printer.flush(sup, out);
+    // Said once, here, because a bad path means the service will not restart
+    // on change and nobody would otherwise know why.
+    for (sup.watcher.problems.items) |problem| {
+        try out.print("devrun: watch: {s}\n", .{problem});
+    }
+
+    // Twice: once until the Workers are done, then once more through the
+    // shutdown ladder, so a Session that simply ran out of work still gets
+    // its stop commands run.
+    for (0..2) |round| {
+        if (round == 1) sup.beginShutdown();
+        while (!sup.done()) {
+            var extra: [control.Server.max_poll_fds]os.PollFd = undefined;
+            const n = if (server) |s| s.fillPollFds(&extra) else 0;
+            try sup.step(extra[0..n], 200);
+            if (server) |s| s.service(extra[0..n], sup);
+            try printer.flush(sup, out);
+        }
     }
     try printer.flush(sup, out);
+    // Faithful to what the command did, including death by signal, which
+    // shells report as 128 + the signal number.
     if (exit_of) |i| {
-        // Faithful to what the command did, including death by signal, which
-        // shells report as 128 + the signal number.
-        const w = &sup.workers[i];
-        const e = w.exit orelse return 1;
         try out.flush();
-        return switch (e) {
-            .exited => |code| code,
-            .signaled => |s| @intCast(128 +| @intFromEnum(s)),
-        };
+        return supervisor.exitStatus(sup.workers[i].exit);
     }
     try printer.summary(sup, out);
+    // `exit-on-end`: the service that ended the Session speaks for it.
+    if (sup.ended_by) |i| return supervisor.exitStatus(sup.workers[i].exit);
     return if (sup.failed_hard or anyFailed(sup)) 1 else 0;
 }
 
@@ -1305,6 +1401,8 @@ test "parseSize reads binary suffixes and refuses anything else" {
 
 test {
     _ = config;
+    _ = @import("toml.zig");
+    _ = @import("watch.zig");
     _ = os;
     _ = archive;
     _ = probe;

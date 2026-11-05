@@ -50,9 +50,10 @@ pub fn run(
     // ~/.local/bin should have the one they invoked replaced, not the other.
     var path_buf: [4096]u8 = undefined;
     const self_path = os.selfExe(&path_buf) orelse {
-        try fail(io,
+        try fail(
+            io,
             "devrun: cannot read /proc/self/exe, so there is no way to tell\n" ++
-            "        which binary to replace. Install over it by hand:\n\n" ++ by_hand,
+                "        which binary to replace. Install over it by hand:\n\n" ++ by_hand,
             .{},
         );
         return 1;
@@ -65,12 +66,13 @@ pub fn run(
         return 1;
     };
     const fetch = fetcher(arena, path_env) orelse {
-        try fail(io,
+        try fail(
+            io,
             "devrun: neither curl nor wget is on PATH, and devrun does not\n" ++
-            "        carry an HTTPS client of its own — linking one would cost\n" ++
-            "        more binary than the whole supervisor. Install either, or\n" ++
-            "        download the release by hand:\n\n" ++
-            "          https://github.com/" ++ repo ++ "/releases/latest\n",
+                "        carry an HTTPS client of its own — linking one would cost\n" ++
+                "        more binary than the whole supervisor. Install either, or\n" ++
+                "        download the release by hand:\n\n" ++
+                "          https://github.com/" ++ repo ++ "/releases/latest\n",
             .{},
         );
         return 1;

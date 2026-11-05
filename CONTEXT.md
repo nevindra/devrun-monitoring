@@ -1,14 +1,18 @@
 # devrun
 
-A process runner for local development: it starts the services a repo needs, shows their logs, and — the reason it exists — lets you get those logs back out. It reads the same `process-compose.yaml` a teammate runs under process-compose.
+A process runner for local development: it starts the services a repo needs, shows their logs, and — the reason it exists — lets you get those logs back out. It reads one file, `devrun.toml`, with a schema of its own.
 
 ## Language
 
 ### Processes
 
 **Worker**:
-One entry under `processes:` in the config. A single Worker usually becomes several OS processes.
+One `[services.<name>]` table in the config. A single Worker usually becomes several OS processes.
 _Avoid_: process, service, job, task
+
+**Template**:
+A named set of service fields under `[templates]`, taken by a service with `extends`. The service's own fields win; `env` and `env_file` add up.
+_Avoid_: base, preset, anchor, mixin
 
 **Group**:
 Every OS process sharing a Worker's process group id. This is the unit that gets measured and the unit that gets killed — never the single pid that was spawned.
@@ -17,6 +21,18 @@ _Avoid_: tree, children, descendants, brood
 **Gate**:
 A Worker that is expected to exit. Its successful exit is what other Workers wait on, so a Gate that never finishes stalls the graph rather than failing it.
 _Avoid_: one-shot, init task, hook, pre-start
+
+**Replica**:
+One instance of a Worker declared with `replicas = N`, named `<name>.<k>` and given `DEVRUN_REPLICA=<k>`. Each is a Worker in its own right, with its own Archive; the bare name on the command line means all of them.
+_Avoid_: copy, clone, instance, shard
+
+**Profile**:
+A named set of Workers under `[profiles.<name>]`, plus an optional `env`, chosen with `devrun up --profile`. Selects what to start; it does not change what a Worker is.
+_Avoid_: environment, mode, preset, stack
+
+**Off**:
+The Worker state for a Worker that is not part of this Session's run: left out by `up NAME`, a Profile, or `autostart = false`. Settled for `devrun wait`, never broken for `devrun errors`, and started later with `devrun start`.
+_Avoid_: stopped, disabled, skipped, idle
 
 **Ready**:
 The state a readiness probe confirms. Distinct from started — a Worker that bound its port is started; one whose probe passed is Ready.

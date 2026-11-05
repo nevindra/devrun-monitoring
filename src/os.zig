@@ -389,6 +389,52 @@ pub const DirIter = struct {
 
     /// The next entry's name, valid until the following call.
     pub fn next(self: *DirIter) ?[]const u8 {
+        const rec = self.nextRecord() orelse return null;
+        return rec.name;
+    }
+
+    pub const Entry = struct {
+        name: []const u8,
+        is_dir: bool,
+    };
+
+    /// Like `next`, but also says whether the entry is a directory. A symlink
+    /// to a directory is not one: callers walking a tree must not follow it,
+    /// or a link back up the tree would recurse forever.
+    ///
+    /// Most filesystems fill in the dirent `type` field. Those that do not
+    /// report DT_UNKNOWN, and for them we ask the kernel with a no-follow
+    /// `openat(O_DIRECTORY)`, which succeeds only for a real directory.
+    pub fn nextEntry(self: *DirIter) ?Entry {
+        const rec = self.nextRecord() orelse return null;
+        const is_dir = switch (rec.kind) {
+            DT_DIR => true,
+            DT_UNKNOWN => self.probeDir(rec.name),
+            else => false,
+        };
+        return .{ .name = rec.name, .is_dir = is_dir };
+    }
+
+    const DT_UNKNOWN = 0;
+    const DT_DIR = 4;
+
+    fn probeDir(self: *DirIter, name: []const u8) bool {
+        // `name` points into `buf` and the record carries its NUL terminator,
+        // so it can be handed to the kernel as is.
+        const z: [*:0]const u8 = @ptrCast(name.ptr);
+        const fd = checkFd(linux.openat(self.fd, z, .{
+            .ACCMODE = .RDONLY,
+            .DIRECTORY = true,
+            .NOFOLLOW = true,
+            .CLOEXEC = true,
+        }, 0)) catch return false;
+        _ = linux.close(fd);
+        return true;
+    }
+
+    const Record = struct { name: []const u8, kind: u8 };
+
+    fn nextRecord(self: *DirIter) ?Record {
         while (true) {
             if (self.pos >= self.len) {
                 const rc = linux.getdents64(self.fd, &self.buf, self.buf.len);
@@ -408,10 +454,28 @@ pub const DirIter = struct {
             // the buffer means the kernel gave us something we cannot parse.
             if (d.reclen == 0 or rec_end > self.len or name_start >= rec_end) return null;
             self.pos = rec_end;
-            return std.mem.sliceTo(self.buf[name_start..rec_end], 0);
+            return .{
+                .name = std.mem.sliceTo(self.buf[name_start..rec_end], 0),
+                .kind = d.type,
+            };
         }
     }
 };
+
+// ------------------------------------------------------------- inotify
+
+/// A non-blocking, close-on-exec inotify descriptor, for the file watcher.
+pub fn inotifyInit() !Fd {
+    return checkFd(linux.inotify_init1(linux.IN.CLOEXEC | linux.IN.NONBLOCK));
+}
+
+/// Adds (or extends) a watch and returns its descriptor. Watching the same
+/// inode twice returns the same `wd`, which callers rely on to merge
+/// interest. `error.NoSpaceLeft` here means the per-user watch limit
+/// (`fs.inotify.max_user_watches`), not a full disk.
+pub fn inotifyAddWatch(fd: Fd, path: [*:0]const u8, mask: u32) !i32 {
+    return checkFd(linux.inotify_add_watch(fd, path, mask));
+}
 
 // ------------------------------------------------------------- poll
 
@@ -463,7 +527,7 @@ pub const Signals = struct {
     fn handler(sig: SIG) callconv(.c) void {
         const fd = write_fd.load(.acquire);
         if (fd < 0) return;
-        const byte: [1]u8 = .{@truncate(@intFromEnum(sig))};
+        const byte: [1]u8 = .{@truncate(@backingInt(sig))};
         // A full pipe means the loop is behind and already has a wake-up
         // queued, so dropping this byte loses nothing: the loop reaps with
         // WNOHANG in a loop and re-checks every deadline on each pass.
@@ -479,7 +543,7 @@ pub const Signals = struct {
         while (true) {
             const n = read(self.read_fd, &buf) catch return seen;
             if (n == 0) return seen;
-            for (buf[0..n]) |b| switch (@as(SIG, @enumFromInt(b))) {
+            for (buf[0..n]) |b| switch (@as(SIG, @fromBackingInt(@intCast(b)))) {
                 .CHLD => seen.chld = true,
                 .INT, .TERM, .QUIT, .HUP => seen.quit = true,
                 .WINCH => seen.winch = true,
@@ -578,8 +642,8 @@ pub const Reaped = struct {
 /// signals coalesce.
 pub fn reap() ?Reaped {
     while (true) {
-        var status: u32 = 0;
-        const rc = linux.wait4(-1, &status, linux.W.NOHANG, null);
+        var raw_status: i32 = 0;
+        const rc = linux.wait4(-1, &raw_status, linux.W.NOHANG, null);
         switch (linux.errno(rc)) {
             .SUCCESS => {},
             .INTR => continue,
@@ -588,6 +652,8 @@ pub fn reap() ?Reaped {
         }
         const pid: Pid = @intCast(rc);
         if (pid == 0) return null;
+        // `wait4` writes an i32 in 0.17 while the `W` macros still read a u32.
+        const status: u32 = @bitCast(raw_status);
         if (linux.W.IFEXITED(status)) {
             return .{ .pid = pid, .exit = .{ .exited = @intCast(linux.W.EXITSTATUS(status)) } };
         }
@@ -608,7 +674,7 @@ pub fn killGroup(pgid: Pid, sig: SIG) void {
 /// True while any process in the Group is still alive. `kill(pgid, 0)` performs
 /// the permission and existence check without delivering anything.
 pub fn groupAlive(pgid: Pid) bool {
-    return linux.errno(linux.kill(-pgid, @enumFromInt(0))) == .SUCCESS;
+    return linux.errno(linux.kill(-pgid, @fromBackingInt(@intCast(0)))) == .SUCCESS;
 }
 
 pub const SpawnArgs = struct {
@@ -684,7 +750,7 @@ pub fn spawn(args: SpawnArgs) SpawnError!Spawned {
     if (n == err_buf.len) {
         // The child could not exec and is already gone; reap it now so it does
         // not surface later as an unknown pid.
-        var status: u32 = 0;
+        var status: i32 = 0;
         _ = linux.wait4(pid, &status, 0, null);
         return error.ExecFailed;
     }
@@ -702,7 +768,7 @@ fn childExec(args: SpawnArgs, sync_fd: Fd) noreturn {
     // logic on Ctrl-C. Reset to default and unblock everything.
     var i: u32 = 1;
     while (i < 32) : (i += 1) {
-        const sig: SIG = @enumFromInt(i);
+        const sig: SIG = @fromBackingInt(@intCast(i));
         // SIGKILL and SIGSTOP cannot be caught, so they were never inherited
         // as anything but default — and asking to reset them is an error.
         if (sig == .KILL or sig == .STOP) continue;
@@ -740,7 +806,7 @@ fn fail(sync_fd: Fd) noreturn {
 /// path. Runs in the parent, where allocating is allowed.
 pub fn resolvePath(arena: Allocator, name: []const u8, path_env: ?[]const u8) ![:0]const u8 {
     if (std.mem.indexOfScalar(u8, name, '/') != null) {
-        return arena.dupeZ(u8, name);
+        return arena.dupeSentinel(u8, name, 0);
     }
     const path = path_env orelse "/usr/local/bin:/usr/bin:/bin";
     var it = std.mem.splitScalar(u8, path, ':');

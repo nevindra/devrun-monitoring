@@ -19,6 +19,7 @@ const config = @import("config.zig");
 const probe_mod = @import("probe.zig");
 const archive_mod = @import("archive.zig");
 const sample_mod = @import("sample.zig");
+const watch_mod = @import("watch.zig");
 
 const Allocator = std.mem.Allocator;
 const Archive = archive_mod.Archive;
@@ -47,10 +48,13 @@ pub const State = enum {
     /// Never started, and never will: a dependency reached a state that can no
     /// longer satisfy the condition this Worker was waiting for.
     skipped,
+    /// Not part of this run yet: left out by `up NAME`, a profile, or
+    /// `autostart = false`. Not a failure and not waiting; `start` brings it in.
+    off,
 
     pub fn terminal(self: State) bool {
         return switch (self) {
-            .exited, .stopped, .failed, .skipped => true,
+            .exited, .stopped, .failed, .skipped, .off => true,
             else => false,
         };
     }
@@ -62,6 +66,17 @@ pub const State = enum {
         };
     }
 };
+
+/// The exit status devrun itself should have when it takes on a Worker's: its
+/// own code, or 128 plus the signal as a shell reports it. A Worker with no
+/// status (it never started) is 1.
+pub fn exitStatus(exit: ?os.Exit) u8 {
+    const e = exit orelse return 1;
+    return switch (e) {
+        .exited => |code| code,
+        .signaled => |s| @intCast(128 +| @backingInt(s)),
+    };
+}
 
 /// Scans a stream for a Worker's `ready_log_line` without buffering the
 /// stream. The only state it carries between chunks is the last `needle-1`
@@ -128,7 +143,7 @@ pub const Runtime = struct {
     probe: ?Probe = null,
     ready_scan: ?ReadyScan = null,
 
-    /// Set once the Worker has ever been spawned. `process_started` asks about
+    /// Set once the Worker has ever been spawned. `started` asks about
     /// this rather than the current state, because a Gate that already ran and
     /// exited did, in fact, start.
     has_started: bool = false,
@@ -137,11 +152,17 @@ pub const Runtime = struct {
     started_ms: u64 = 0,
     stopped_ms: u64 = 0,
 
+    /// Restarts since the last manual start, automatic or watch-driven. This
+    /// is what `status` shows; it only goes up, so a Worker that flaps stays
+    /// visibly flapping even after a long healthy run.
     restarts: u32 = 0,
+    /// Automatic restarts in a row, which is what `restart.max` is measured
+    /// against. A run that lasted 30 s resets it. Kept apart from `restarts`
+    /// so that forgiving a good run does not also erase the evidence.
+    streak: u32 = 0,
     /// When a restart may happen. Backoff exists because a Worker that fails
     /// instantly under `restart: always` would otherwise spin the loop at
-    /// 100% CPU — process-compose has `backoff_seconds` for this; devrun does
-    /// not read that field, so it derives one instead.
+    /// 100% CPU. There is no field for it yet, so devrun derives one.
     restart_at_ms: u64 = 0,
     /// When the ladder escalates from the configured signal to SIGKILL.
     kill_at_ms: u64 = 0,
@@ -151,6 +172,19 @@ pub const Runtime = struct {
     envp: [*:null]const ?[*:0]const u8 = undefined,
     cwd: ?[*:0]const u8 = null,
 
+    // `stop.command`, if the Worker has one.
+    stop_argv: ?[*:null]const ?[*:0]const u8 = null,
+    /// Group of the running stop command, zero when none is.
+    stop_pgid: os.Pid = 0,
+    /// When a stop command that is still running gets killed.
+    stop_deadline_ms: u64 = 0,
+    /// The stop command has been tried since the Worker last spawned. Tried,
+    /// not succeeded: a command that fails to launch must not be retried on
+    /// every pass of the shutdown ladder.
+    stop_ran: bool = false,
+    /// `stop.signal` is owed once the stop command has finished.
+    signal_pending: bool = false,
+
     pub fn name(self: Runtime) []const u8 {
         return self.spec.name;
     }
@@ -159,7 +193,7 @@ pub const Runtime = struct {
 pub const Options = struct {
     io: std.Io,
     environ: *const std.process.Environ.Map,
-    /// Directory the config was read from; `dotenv` paths and the default
+    /// Directory the config was read from; `env_file` paths and the default
     /// working directory resolve against it.
     base_dir: []const u8,
     /// Where this Session's Archives are written — its own directory under
@@ -221,6 +255,10 @@ pub const Supervisor = struct {
     project: []const u8,
 
     shutting_down: bool = false,
+    /// The Worker whose `exit-on-end` policy ended this Session, so the
+    /// process can exit with its status.
+    ended_by: ?usize = null,
+    watcher: watch_mod.Watcher,
     /// Set when a Worker with `restart: exit_on_failure` failed. Reported by
     /// `run` so the exit status can carry it.
     failed_hard: bool = false,
@@ -290,6 +328,7 @@ pub const Supervisor = struct {
             );
             rt.* = .{
                 .spec = spec,
+                .state = if (spec.autostart) .pending else .off,
                 .archive = Archive.create(gpa, path.ptr, index_path.ptr, window_bytes) catch {
                     return failWith(gpa, diag, "cannot write Archive {s}", .{path});
                 },
@@ -297,15 +336,18 @@ pub const Supervisor = struct {
             made += 1;
 
             rt.argv = try buildArgv(arena, shell_path.ptr, cfg.shell.argument, spec.command);
-            rt.envp = try buildEnv(arena, opts, spec, diag, gpa);
+            rt.envp = try buildEnv(arena, opts, spec, cfg.color, diag, gpa);
             rt.cwd = try resolveCwd(arena, opts.base_dir, spec.working_dir);
+            if (spec.shutdown.command) |cmd| {
+                rt.stop_argv = try buildArgv(arena, shell_path.ptr, cfg.shell.argument, cmd);
+            }
 
             if (spec.ready_log_line) |line| {
                 if (line.len == 0 or line.len > ReadyScan.max_needle) {
                     return failWith(
                         gpa,
                         diag,
-                        "processes.{s}.ready_log_line must be 1..{d} bytes",
+                        "services.{s}.ready.log must be 1..{d} bytes",
                         .{ spec.name, ReadyScan.max_needle },
                     );
                 }
@@ -316,7 +358,7 @@ pub const Supervisor = struct {
                     .path = shell_path.ptr,
                     .argument = cfg.shell.argument,
                 }, now) catch |err| {
-                    return failWith(gpa, diag, "processes.{s}.readiness_probe: {s}", .{
+                    return failWith(gpa, diag, "services.{s}.ready: {s}", .{
                         spec.name,
                         switch (err) {
                             error.HttpsProbeUnsupported => "scheme \"https\" is not supported; " ++
@@ -333,12 +375,44 @@ pub const Supervisor = struct {
         const dependents = try buildDependents(arena, cfg.workers);
         const dep_targets = try buildDepTargets(arena, cfg);
 
+        // Paths are relative to the Worker's cwd. A Worker with none inherits
+        // devrun's, but the config's directory is what its other relative
+        // paths mean, so that is the base.
+        var targets: std.ArrayList(watch_mod.Target) = .empty;
+        for (cfg.workers, workers, 0..) |spec, rt, i| {
+            const wt = spec.watch orelse continue;
+            try targets.append(arena, .{
+                .worker = @intCast(i),
+                .base = if (rt.cwd) |c| std.mem.span(c) else opts.base_dir,
+                .paths = wt.paths,
+                .ignore = wt.ignore,
+                .debounce_ms = wt.debounce_ms,
+            });
+        }
+        var watcher = try watch_mod.Watcher.init(gpa, targets.items, n);
+        errdefer watcher.deinit();
+
         var signals = try os.Signals.install(&.{ .CHLD, .INT, .TERM, .HUP, .WINCH });
         errdefer signals.deinit();
 
         // Orphaned grandchildren come back to us instead of escaping to PID 1,
         // so a Worker that daemonises is still part of its Group's accounting.
         os.becomeSubreaper();
+
+        // Everything that allocates from the arena comes before the struct
+        // copies it: a chunk the arena grows after the copy would belong to
+        // a state nobody holds, and `deinit` would never free it.
+        const log_dir = try arena.dupe(u8, opts.log_dir);
+        const log_root = try arena.dupe(u8, opts.log_root);
+        const project = try arena.dupe(u8, opts.project);
+        // Worst case each Worker contributes an output pipe (a stop command's
+        // reuses that slot) and a probe socket, plus the signal pipe, the
+        // watcher, and room for the caller's own.
+        const poll_buf = try arena.alloc(os.PollFd, 2 * n + 24);
+        const poll_owner = try arena.alloc(u32, 2 * n + 24);
+        const read_buf = try gpa.alloc(u8, 64 << 10);
+        errdefer gpa.free(read_buf);
+        const sampler = try sample_mod.Sampler.init(gpa, n);
 
         return .{
             .gpa = gpa,
@@ -347,18 +421,17 @@ pub const Supervisor = struct {
             .workers = workers,
             .dependents = dependents,
             .dep_targets = dep_targets,
+            .watcher = watcher,
             .signals = signals,
             .devnull = devnull,
             .shell = .{ .path = shell_path.ptr, .argument = cfg.shell.argument },
-            .log_dir = try arena.dupe(u8, opts.log_dir),
-            .log_root = try arena.dupe(u8, opts.log_root),
-            .project = try arena.dupe(u8, opts.project),
-            // Worst case each Worker contributes an output pipe and a probe
-            // socket, plus the signal pipe and room for the caller's own.
-            .poll_buf = try arena.alloc(os.PollFd, 2 * n + 8),
-            .poll_owner = try arena.alloc(u32, 2 * n + 8),
-            .read_buf = try gpa.alloc(u8, 64 << 10),
-            .sampler = try sample_mod.Sampler.init(gpa, n),
+            .log_dir = log_dir,
+            .log_root = log_root,
+            .project = project,
+            .poll_buf = poll_buf,
+            .poll_owner = poll_owner,
+            .read_buf = read_buf,
+            .sampler = sampler,
             .samples = try gpa.alloc(sample_mod.Sample, n),
             .pgid_scratch = try gpa.alloc(os.Pid, n),
         };
@@ -369,6 +442,7 @@ pub const Supervisor = struct {
             if (w.out_fd >= 0) os.close(w.out_fd);
             w.archive.deinit(self.gpa);
         }
+        self.watcher.deinit();
         self.gpa.free(self.read_buf);
         self.gpa.free(self.samples);
         self.gpa.free(self.pgid_scratch);
@@ -422,6 +496,11 @@ pub const Supervisor = struct {
             self.poll_owner[n] = @intCast(i);
             n += 1;
         }
+        const watch_first = n;
+        if (self.watcher.pollFd()) |pf| {
+            fds[n] = pf;
+            n += 1;
+        }
         const extra_first = n;
         for (extra) |e| {
             fds[n] = e;
@@ -450,7 +529,11 @@ pub const Supervisor = struct {
             self.drain(i);
         }
 
-        for (fds[probe_first..extra_first], probe_first..) |f, slot| {
+        if (watch_first < extra_first and fds[watch_first].revents != 0) {
+            self.watcher.onReadable(os.nowMs());
+        }
+
+        for (fds[probe_first..watch_first], probe_first..) |f, slot| {
             if (f.revents == 0) continue;
             const p = if (self.workers[self.poll_owner[slot]].probe) |*p| p else continue;
             // The attempt may have been abandoned since — a Worker that exited
@@ -486,10 +569,12 @@ pub const Supervisor = struct {
                 if (w.state.alive()) soonest = @min(soonest, p.wakeAt());
             }
             if (w.state == .stopping) soonest = @min(soonest, w.kill_at_ms);
+            if (w.stop_pgid != 0) soonest = @min(soonest, w.stop_deadline_ms);
             if (w.restart_at_ms > 0 and w.state.terminal()) {
                 soonest = @min(soonest, w.restart_at_ms);
             }
         }
+        if (self.watcher.wakeAt()) |t| soonest = @min(soonest, t);
         if (soonest == std.math.maxInt(u64)) return cap_ms;
         const wait = soonest -| now;
         return @intCast(@min(@as(u64, @intCast(@max(cap_ms, 0))), wait));
@@ -526,8 +611,19 @@ pub const Supervisor = struct {
     fn reapAll(self: *Supervisor) void {
         while (os.reap()) |r| {
             self.generation += 1;
-            // A probe's Group, or the Worker's own?
+            // A stop command's Group first: it belongs to a Worker by name
+            // but is not the Worker, and must never be taken for it.
             var claimed = false;
+            for (self.workers, 0..) |*w, i| {
+                if (w.stop_pgid == r.pid) {
+                    self.onStopExit(i);
+                    claimed = true;
+                    break;
+                }
+            }
+            if (claimed) continue;
+
+            // A probe's Group, or the Worker's own?
             for (self.workers) |*w| {
                 if (w.probe) |*p| {
                     if (p.onReap(r.pid, r.exit)) {
@@ -555,6 +651,7 @@ pub const Supervisor = struct {
         w.exit = exit;
         w.stopped_ms = os.nowMs();
         w.pgid = 0;
+        w.signal_pending = false;
         // A Worker we signalled did what it was told, however it died.
         w.state = if (was_stopping)
             .stopped
@@ -576,17 +673,43 @@ pub const Supervisor = struct {
                 self.failed_hard = true;
                 self.beginShutdown();
             },
+            .exit_on_end => {
+                self.ended_by = i;
+                self.beginShutdown();
+            },
         }
     }
 
-    /// Exponential backoff, capped. The first restart is immediate enough to
-    /// feel instant; a Worker that keeps dying backs off instead of pinning a
-    /// core.
+    /// A stop command finished (or was killed). If the Worker is still up,
+    /// the command was a courtesy and the configured signal is now due.
+    fn onStopExit(self: *Supervisor, i: usize) void {
+        const w = &self.workers[i];
+        w.stop_pgid = 0;
+        // Its output is in the pipe already; take it before the pipe is
+        // forgotten, or the last line of a cleanup never reaches the log.
+        if (w.out_fd >= 0) self.drain(i);
+        if (w.state == .stopping and w.signal_pending and w.pgid != 0) {
+            os.killGroup(w.pgid, @fromBackingInt(@intCast(w.spec.shutdown.signal)));
+        }
+        w.signal_pending = false;
+        self.generation += 1;
+    }
+
+    /// Exponential backoff from `restart.backoff`, capped at 30 s (or the
+    /// backoff itself, if that is longer), so a Worker that keeps dying backs
+    /// off instead of pinning a core. With `restart.max` set, the Worker is
+    /// left as it died once that many restarts have happened in a row.
     fn scheduleRestart(self: *Supervisor, i: usize) void {
         const w = &self.workers[i];
+        // A long healthy run earns a clean slate.
+        if (w.stopped_ms -| w.started_ms >= 30_000) w.streak = 0;
+        if (w.spec.restart_max > 0 and w.streak >= w.spec.restart_max) return;
+
+        const base: u64 = w.spec.restart_backoff_ms;
+        const shift: u6 = @intCast(@min(w.streak, 16));
+        const delay = @min(base << shift, @max(base, 30_000));
+        w.streak += 1;
         w.restarts += 1;
-        const shift: u6 = @intCast(@min(w.restarts, 8));
-        const delay = @min(@as(u64, 100) << shift, 30_000);
         w.restart_at_ms = os.nowMs() + delay;
     }
 
@@ -596,6 +719,12 @@ pub const Supervisor = struct {
         const now = os.nowMs();
 
         for (self.workers, 0..) |*w, i| {
+            // A stop command is bounded by the same timeout as the stop it is
+            // part of. Re-armed like the Worker's own kill, for the same reason.
+            if (w.stop_pgid != 0 and now >= w.stop_deadline_ms) {
+                os.killGroup(w.stop_pgid, .KILL);
+                w.stop_deadline_ms = now + 1000;
+            }
             switch (w.state) {
                 .pending => {
                     switch (self.dependencyStatus(i)) {
@@ -638,7 +767,18 @@ pub const Supervisor = struct {
                         self.generation += 1;
                     }
                 },
-                .skipped => {},
+                .skipped, .off => {},
+            }
+        }
+
+        // A debounce that elapsed. Drained even during shutdown, or its
+        // deadline would stay in the past and keep the poll timeout at zero.
+        while (self.watcher.takeDue(now)) |wi| {
+            if (self.shutting_down) continue;
+            const w = &self.workers[wi];
+            switch (w.state) {
+                .off, .pending => {},
+                else => self.watchRestart(wi),
             }
         }
 
@@ -656,18 +796,22 @@ pub const Supervisor = struct {
         for (self.workers[i].spec.depends_on, self.dep_targets[i]) |dep, target| {
             if (target == unresolved_dep) continue; // validated at load
             const d = &self.workers[target];
+            // Left out of this run on purpose (`--no-deps`), so there is
+            // nothing to wait for. Starting one by hand pulls its off
+            // dependencies in first, which is why this is not a deadlock.
+            if (d.state == .off) continue;
             const one: DepStatus = switch (dep.condition) {
-                .process_started => if (d.has_started)
+                .started => if (d.has_started)
                     .satisfied
                 else if (d.state == .skipped) .impossible else .waiting,
 
-                .process_completed => switch (d.state) {
+                .exited => switch (d.state) {
                     .exited, .failed, .stopped => .satisfied,
                     .skipped => .impossible,
                     else => .waiting,
                 },
 
-                .process_completed_successfully => switch (d.state) {
+                .succeeded => switch (d.state) {
                     .exited => .satisfied,
                     // A Gate that failed will not succeed by being waited on
                     // longer. Restart policy may yet revive it, so only a
@@ -677,11 +821,10 @@ pub const Supervisor = struct {
                     else => .waiting,
                 },
 
-                .process_healthy => if (d.state == .ready)
-                    .satisfied
-                else if (d.state == .skipped) .impossible else .waiting,
-
-                .process_log_ready => if (d.log_ready)
+                // A probe answers through the state, a log line through its
+                // own flag. The config never gives one Worker both.
+                .ready => if ((d.spec.readiness_probe != null and d.state == .ready) or
+                    (d.spec.readiness_probe == null and d.log_ready))
                     .satisfied
                 else if (d.state == .skipped) .impossible else .waiting,
             };
@@ -733,8 +876,13 @@ pub const Supervisor = struct {
         // when the Group finally exits.
         os.close(fds[1]);
 
+        // A stop command's pipe may still be here; its writer is gone or about
+        // to be, and the new Group needs the slot.
+        if (w.out_fd >= 0) os.close(w.out_fd);
         w.out_fd = fds[0];
         w.pgid = child.pgid;
+        w.stop_ran = false;
+        w.signal_pending = false;
         w.state = .running;
         w.has_started = true;
         w.exit = null;
@@ -759,35 +907,108 @@ pub const Supervisor = struct {
     }
 
     /// Stops Workers in reverse dependency order, without a layer index: a
-    /// Worker may be signalled once everything that depends on it is terminal.
+    /// Worker may be stopped once everything that depends on it is settled,
+    /// which includes its own stop command having finished.
     ///
-    /// This always finishes. Every ladder ends in SIGKILL, so each dependent
-    /// reaches a terminal state in bounded time, which unblocks the Worker
-    /// below it — the API goes down before the database it is talking to.
+    /// This always finishes. Every ladder ends in SIGKILL, and a stop command
+    /// is killed at the same deadline, so each dependent reaches a settled
+    /// state in bounded time, which unblocks the Worker below it. The API goes
+    /// down before the database it is talking to.
     fn advanceShutdown(self: *Supervisor) void {
         const now = os.nowMs();
         for (self.workers, 0..) |*w, i| {
-            if (w.state != .running and w.state != .ready) continue;
             if (!self.dependentsFinished(i)) continue;
-
-            os.killGroup(w.pgid, @enumFromInt(w.spec.shutdown.signal));
-            w.state = .stopping;
-            w.kill_at_ms = now + @as(u64, w.spec.shutdown.timeout_seconds) * 1000;
-            self.generation += 1;
+            switch (w.state) {
+                .running, .ready => self.beginStop(i, now),
+                // Gone already, but a stop command may still owe it a cleanup.
+                .exited, .stopped, .failed, .skipped => _ = self.startStopCommand(i, now),
+                .pending, .stopping, .off => {},
+            }
         }
     }
 
+    /// Settled: terminal, and no stop command running or still to run.
     fn dependentsFinished(self: *Supervisor, i: usize) bool {
         for (self.dependents[i]) |d| {
-            if (!self.workers[d].state.terminal()) return false;
+            const x = &self.workers[d];
+            if (!x.state.terminal() or x.stop_pgid != 0 or stopOwed(x)) return false;
         }
         return true;
     }
 
+    fn stopOwed(w: *const Runtime) bool {
+        return w.spec.shutdown.command != null and w.has_started and !w.stop_ran;
+    }
+
+    /// Starts the Worker's `stop.command` unless it has run, or is running.
+    /// Returns whether one is now in flight.
+    ///
+    /// Its output goes to the Worker's Archive when the Worker's own pipe has
+    /// closed (a new pipe takes the slot, so `drain` picks it up like any other
+    /// output) and to /dev/null otherwise, because a live pipe has a Group
+    /// writing into it and interleaving a second writer there would garble both.
+    fn startStopCommand(self: *Supervisor, i: usize, now: u64) bool {
+        const w = &self.workers[i];
+        if (w.stop_pgid != 0) return true;
+        if (!stopOwed(w)) return false;
+        w.stop_ran = true;
+        const argv = w.stop_argv orelse return false;
+
+        var out: os.Fd = self.devnull;
+        var read_end: os.Fd = -1;
+        if (w.out_fd < 0) {
+            if (os.pipe(.{ .CLOEXEC = true })) |fds| {
+                os.setNonblock(fds[0], true);
+                read_end = fds[0];
+                out = fds[1];
+            } else |_| {}
+        }
+
+        const child = os.spawn(.{
+            .path = self.shell.path,
+            .argv = argv,
+            .envp = w.envp,
+            .cwd = w.cwd,
+            .output = out,
+            .input = self.devnull,
+        }) catch {
+            if (read_end >= 0) {
+                os.close(read_end);
+                os.close(out);
+            }
+            return false;
+        };
+        if (read_end >= 0) {
+            os.close(out);
+            w.out_fd = read_end;
+        }
+        w.stop_pgid = child.pgid;
+        w.stop_deadline_ms = now + @as(u64, w.spec.shutdown.timeout_seconds) * 1000;
+        self.generation += 1;
+        return true;
+    }
+
+    /// Moves a live Worker onto the ladder: the stop command first if it has
+    /// one (the signal follows when it finishes), else the signal at once.
+    fn beginStop(self: *Supervisor, i: usize, now: u64) void {
+        const w = &self.workers[i];
+        w.state = .stopping;
+        w.kill_at_ms = now + @as(u64, w.spec.shutdown.timeout_seconds) * 1000;
+        w.signal_pending = self.startStopCommand(i, now);
+        if (!w.signal_pending) {
+            os.killGroup(w.pgid, @fromBackingInt(@intCast(w.spec.shutdown.signal)));
+        }
+        self.generation += 1;
+    }
+
     /// True when there is nothing left to wait for.
     pub fn done(self: *Supervisor) bool {
-        for (self.workers) |w| {
+        for (self.workers) |*w| {
             if (!w.state.terminal()) return false;
+            if (w.stop_pgid != 0) return false;
+            // A cleanup still owed is work; not yet started only matters once
+            // the ladder is the thing that will start it.
+            if (self.shutting_down and stopOwed(w)) return false;
             // A Worker with a restart pending is terminal only for the moment.
             if (w.restart_at_ms > 0 and !self.shutting_down) return false;
         }
@@ -795,25 +1016,39 @@ pub const Supervisor = struct {
     }
 
     /// Asks a single Worker to stop, as the control socket's `stop` does.
+    /// A Worker that already exited still gets its stop command, which is what
+    /// lets `docker compose up -d` be undone.
     pub fn stopWorker(self: *Supervisor, i: usize) void {
         const w = &self.workers[i];
         w.restart_at_ms = 0;
+        if (w.state.terminal()) {
+            _ = self.startStopCommand(i, os.nowMs());
+            return;
+        }
         if (!w.state.alive() or w.state == .stopping) return;
-        os.killGroup(w.pgid, @enumFromInt(w.spec.shutdown.signal));
-        w.state = .stopping;
-        w.kill_at_ms = os.nowMs() + @as(u64, w.spec.shutdown.timeout_seconds) * 1000;
-        self.generation += 1;
+        self.beginStop(i, os.nowMs());
     }
 
     /// Puts a terminal Worker back in the queue. Its dependencies are checked
-    /// again on the next pass, so starting one by hand cannot bypass the graph.
+    /// again on the next pass, so starting one by hand cannot bypass the graph;
+    /// a dependency that is `off` is brought in too, since nothing else would.
     pub fn startWorker(self: *Supervisor, i: usize) void {
+        self.queue(i, true);
+    }
+
+    fn queue(self: *Supervisor, i: usize, fresh: bool) void {
         const w = &self.workers[i];
         if (!w.state.terminal()) return;
         w.state = .pending;
         w.restart_at_ms = 0;
-        w.restarts = 0;
+        w.streak = 0;
+        if (fresh) w.restarts = 0;
         self.generation += 1;
+        // After the state change, so a cycle that slipped past the loader
+        // ends here instead of recursing.
+        for (self.dep_targets[i]) |t| {
+            if (t != unresolved_dep and self.workers[t].state == .off) self.queue(t, true);
+        }
     }
 
     pub fn restartWorker(self: *Supervisor, i: usize) void {
@@ -823,6 +1058,20 @@ pub const Supervisor = struct {
         // Come back as soon as the old Group is reaped, not on a timer.
         w.restart_at_ms = 1;
         w.restarts = 0;
+        w.streak = 0;
+    }
+
+    /// A watched path changed. Like `restartWorker`, but the count keeps
+    /// going up: a change is a restart worth seeing in `status`.
+    fn watchRestart(self: *Supervisor, i: usize) void {
+        const w = &self.workers[i];
+        const seen = w.restarts;
+        if (w.state.terminal()) self.queue(i, false) else {
+            self.stopWorker(i);
+            w.restart_at_ms = 1;
+            w.streak = 0;
+        }
+        w.restarts = seen + 1;
     }
 };
 
@@ -836,19 +1085,24 @@ fn buildArgv(
 ) ![*:null]const ?[*:0]const u8 {
     const argv = try arena.allocSentinel(?[*:0]const u8, 3, null);
     argv[0] = shell_path;
-    argv[1] = (try arena.dupeZ(u8, shell_arg)).ptr;
-    argv[2] = (try arena.dupeZ(u8, command)).ptr;
+    argv[1] = (try arena.dupeSentinel(u8, shell_arg, 0)).ptr;
+    argv[2] = (try arena.dupeSentinel(u8, command, 0)).ptr;
     return argv.ptr;
 }
 
-/// Layers the environment the way process-compose does: the OS environment
-/// first, then each `dotenv` file, then the explicit `environment` list. Later
-/// layers win, so a value written in the config beats one inherited from the
-/// shell that launched devrun.
+/// Layers the environment: the OS environment first, then each `env_file`,
+/// then the explicit `env` entries. Later layers win, so a value written in
+/// the config beats one inherited from the shell that launched devrun.
+///
+/// `color` adds `FORCE_COLOR=1` and `CLICOLOR_FORCE=1` underneath all of it:
+/// a Worker writes into a pipe, so most tools would drop their colour. They
+/// are only defaults, so a value from any layer beats them, and `NO_COLOR`
+/// anywhere in the final environment means they are not added.
 fn buildEnv(
     arena: Allocator,
     opts: Options,
     spec: *const config.Worker,
+    color: bool,
     diag: ?*Diagnostic,
     gpa: Allocator,
 ) ![*:null]const ?[*:0]const u8 {
@@ -859,7 +1113,7 @@ fn buildEnv(
         try map.put(arena, kv.key_ptr.*, kv.value_ptr.*);
     }
 
-    for (spec.dotenv) |file| {
+    for (spec.env_file) |file| {
         const path = try std.fs.path.join(arena, &.{ opts.base_dir, file });
         const text = std.Io.Dir.cwd().readFileAlloc(
             opts.io,
@@ -867,18 +1121,24 @@ fn buildEnv(
             arena,
             .limited(4 << 20),
         ) catch {
-            // An explicitly named dotenv that is missing is a mistake worth
+            // An explicitly named env file that is missing is a mistake worth
             // reporting: the config asked for it by name.
-            return Supervisor.failWith(gpa, diag, "processes.{s}.dotenv: cannot read {s}", .{
+            return Supervisor.failWith(gpa, diag, "services.{s}.env_file: cannot read {s}", .{
                 spec.name, path,
             });
         };
         try parseDotenv(arena, text, &map);
     }
 
-    for (spec.environment) |entry| {
+    for (spec.env) |entry| {
         const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
         try map.put(arena, entry[0..eq], entry[eq + 1 ..]);
+    }
+
+    if (color and !map.contains("NO_COLOR")) {
+        for ([_][]const u8{ "FORCE_COLOR", "CLICOLOR_FORCE" }) |key| {
+            if (!map.contains(key)) try map.put(arena, key, "1");
+        }
     }
 
     const envp = try arena.allocSentinel(?[*:0]const u8, map.count(), null);
@@ -917,9 +1177,9 @@ fn parseDotenv(
 
 fn resolveCwd(arena: Allocator, base_dir: []const u8, working_dir: ?[]const u8) !?[*:0]const u8 {
     const dir = working_dir orelse return null;
-    if (std.fs.path.isAbsolute(dir)) return (try arena.dupeZ(u8, dir)).ptr;
+    if (std.fs.path.isAbsolute(dir)) return (try arena.dupeSentinel(u8, dir, 0)).ptr;
     const joined = try std.fs.path.join(arena, &.{ base_dir, dir });
-    return (try arena.dupeZ(u8, joined)).ptr;
+    return (try arena.dupeSentinel(u8, joined, 0)).ptr;
 }
 
 /// Stands in for a `depends_on` naming a Worker that is not in the config.
@@ -1012,13 +1272,13 @@ test "buildDependents inverts the graph" {
     defer arena_state.deinit();
 
     const workers = [_]config.Worker{
-        .{ .name = "db", .command = "postgres" },
-        .{ .name = "api", .command = "go run .", .depends_on = &.{
-            .{ .name = "db", .condition = .process_started },
+        .{ .name = "db", .group = "db", .command = "postgres" },
+        .{ .name = "api", .group = "api", .command = "go run .", .depends_on = &.{
+            .{ .name = "db", .condition = .started },
         } },
-        .{ .name = "web", .command = "vite", .depends_on = &.{
-            .{ .name = "db", .condition = .process_started },
-            .{ .name = "api", .condition = .process_started },
+        .{ .name = "web", .group = "web", .command = "vite", .depends_on = &.{
+            .{ .name = "db", .condition = .started },
+            .{ .name = "api", .condition = .started },
         } },
     };
 
@@ -1087,14 +1347,11 @@ test "a Gate runs to completion before its dependant starts" {
     defer gpa.free(dir);
 
     var cfg = try loadCfg(gpa,
-        \\processes:
-        \\  gate:
-        \\    command: "echo gate-ran"
-        \\  after:
-        \\    command: "echo after-ran"
-        \\    depends_on:
-        \\      gate:
-        \\        condition: process_completed_successfully
+        \\[services.gate]
+        \\run = "echo gate-ran"
+        \\[services.after]
+        \\run = "echo after-ran"
+        \\after = { gate = "succeeded" }
         \\
     );
     defer cfg.deinit();
@@ -1118,14 +1375,11 @@ test "a Gate that fails leaves its dependant skipped, not waiting forever" {
     defer gpa.free(dir);
 
     var cfg = try loadCfg(gpa,
-        \\processes:
-        \\  gate:
-        \\    command: "exit 3"
-        \\  after:
-        \\    command: "echo SHOULD-NOT-RUN"
-        \\    depends_on:
-        \\      gate:
-        \\        condition: process_completed_successfully
+        \\[services.gate]
+        \\run = "exit 3"
+        \\[services.after]
+        \\run = "echo SHOULD-NOT-RUN"
+        \\after = { gate = "succeeded" }
         \\
     );
     defer cfg.deinit();
@@ -1148,9 +1402,8 @@ test "output reaches the Archive byte-for-byte, ANSI included" {
     defer gpa.free(dir);
 
     var cfg = try loadCfg(gpa,
-        \\processes:
-        \\  noisy:
-        \\    command: "printf 'plain\nESC[31mred\n'"
+        \\[services.noisy]
+        \\run = "printf 'plain\nESC[31mred\n'"
         \\
     );
     defer cfg.deinit();
@@ -1178,9 +1431,8 @@ test "a Worker that out-runs the loop is throttled, not killed" {
     // pipe fills and dies — `yes | head` exits 1 after exactly one buffer.
     // The Worker blocking instead is the entire point.
     var cfg = try loadCfg(gpa,
-        \\processes:
-        \\  firehose:
-        \\    command: "yes 0123456789abcdef0123456789abcdef | head -c 4000000"
+        \\[services.firehose]
+        \\run = "yes 0123456789abcdef0123456789abcdef | head -c 4000000"
         \\
     );
     defer cfg.deinit();
@@ -1210,11 +1462,9 @@ test "a Group's grandchildren are killed with it, not orphaned" {
     defer gpa.free(dir);
 
     var cfg = try loadCfg(gpa,
-        \\processes:
-        \\  parent:
-        \\    command: "sleep 120 & echo spawned; wait"
-        \\    shutdown:
-        \\      timeout_seconds: 1
+        \\[services.parent]
+        \\run = "sleep 120 & echo spawned; wait"
+        \\stop.timeout = 1
         \\
     );
     defer cfg.deinit();
@@ -1264,8 +1514,340 @@ test "a Group's grandchildren are killed with it, not orphaned" {
     try testing.expect(!os.groupAlive(pgid));
 }
 
+/// Steps the loop until `pred` holds or the deadline passes.
+fn stepUntil(sup: *Supervisor, timeout_ms: u64, comptime pred: fn (*Supervisor) bool) !bool {
+    const deadline = os.nowMs() + timeout_ms;
+    while (os.nowMs() < deadline) {
+        if (pred(sup)) return true;
+        try sup.step(&.{}, 25);
+    }
+    return pred(sup);
+}
+
+fn testSupervisor(
+    gpa: Allocator,
+    cfg: *config.Config,
+    dir: []const u8,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
+) !Supervisor {
+    return Supervisor.init(gpa, cfg, .{
+        .io = io,
+        .environ = environ,
+        .base_dir = dir,
+        .log_dir = dir,
+    }, null);
+}
+
+fn shutDown(sup: *Supervisor) !void {
+    sup.beginShutdown();
+    const deadline = os.nowMs() + 10_000;
+    while (!sup.done() and os.nowMs() < deadline) try sup.step(&.{}, 25);
+    try testing.expect(sup.done());
+}
+
+test "autostart = false stays off while its sibling runs, and start brings in what it needs" {
+    const gpa = testing.allocator;
+    const dir = try tempDir(gpa, "off");
+    defer gpa.free(dir);
+
+    var cfg = try loadCfg(gpa,
+        \\[services.db]
+        \\run = "echo db-ran"
+        \\autostart = false
+        \\[services.api]
+        \\run = "echo api-ran"
+        \\autostart = false
+        \\after = ["db"]
+        \\[services.sibling]
+        \\run = "echo sibling-ran"
+        \\
+    );
+    defer cfg.deinit();
+
+    var sup = try runToCompletion(gpa, &cfg, dir, 10_000);
+    defer sup.deinit();
+
+    try testing.expect(sup.done());
+    try testing.expectEqual(State.off, sup.workers[0].state);
+    try testing.expectEqual(State.off, sup.workers[1].state);
+    try testing.expectEqual(State.exited, sup.workers[2].state);
+    try testing.expectEqual(@as(u64, 0), sup.workers[0].archive.len());
+
+    // Starting api by hand starts db too: api waits on it, and nothing else
+    // would ever bring it in.
+    sup.startWorker(1);
+    try testing.expectEqual(State.pending, sup.workers[0].state);
+    const deadline = os.nowMs() + 10_000;
+    while (!sup.done() and os.nowMs() < deadline) try sup.step(&.{}, 25);
+    try testing.expectEqual(State.exited, sup.workers[0].state);
+    try testing.expectEqual(State.exited, sup.workers[1].state);
+}
+
+test "a dependency that is off counts as satisfied" {
+    const gpa = testing.allocator;
+    const dir = try tempDir(gpa, "nodeps");
+    defer gpa.free(dir);
+
+    var cfg = try loadCfg(gpa,
+        \\[services.db]
+        \\run = "echo db"
+        \\autostart = false
+        \\[services.api]
+        \\run = "echo api-ran"
+        \\after = ["db"]
+        \\
+    );
+    defer cfg.deinit();
+    // The `--no-deps` case: db never starts, and api does not wait for it.
+    var sup = try runToCompletion(gpa, &cfg, dir, 10_000);
+    defer sup.deinit();
+    try testing.expectEqual(State.off, sup.workers[0].state);
+    try testing.expectEqual(State.exited, sup.workers[1].state);
+}
+
+test "restart max gives up after that many restarts and leaves the Worker failed" {
+    const gpa = testing.allocator;
+    const dir = try tempDir(gpa, "max");
+    defer gpa.free(dir);
+
+    var cfg = try loadCfg(gpa,
+        \\[services.flaky]
+        \\run = "exit 1"
+        \\restart = { policy = "on-failure", max = 2, backoff = "50ms" }
+        \\
+    );
+    defer cfg.deinit();
+
+    var sup = try runToCompletion(gpa, &cfg, dir, 10_000);
+    defer sup.deinit();
+
+    try testing.expect(sup.done());
+    try testing.expectEqual(State.failed, sup.workers[0].state);
+    try testing.expectEqual(@as(u32, 2), sup.workers[0].restarts);
+}
+
+test "exit-on-end ends the Session with that Worker's status" {
+    const gpa = testing.allocator;
+    const dir = try tempDir(gpa, "eoe");
+    defer gpa.free(dir);
+
+    var cfg = try loadCfg(gpa,
+        \\[services.server]
+        \\run = "sleep 60"
+        \\stop.timeout = 1
+        \\[services.suite]
+        \\run = "exit 3"
+        \\restart = "exit-on-end"
+        \\
+    );
+    defer cfg.deinit();
+
+    var sup = try runToCompletion(gpa, &cfg, dir, 15_000);
+    defer sup.deinit();
+
+    try testing.expect(sup.done());
+    try testing.expectEqual(@as(?usize, 1), sup.ended_by);
+    try testing.expectEqual(@as(u8, 3), exitStatus(sup.workers[1].exit));
+    try testing.expectEqual(State.stopped, sup.workers[0].state);
+}
+
+test "stop.command runs for a Worker that already exited, and its output lands in the Archive" {
+    const gpa = testing.allocator;
+    const dir = try tempDir(gpa, "stopcmd");
+    defer gpa.free(dir);
+
+    var cfg = try loadCfg(gpa,
+        \\[services.daemon]
+        \\run = "echo up"
+        \\stop.command = "echo cleaned"
+        \\
+    );
+    defer cfg.deinit();
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var environ: std.process.Environ.Map = .init(gpa);
+    defer environ.deinit();
+    try environ.put("PATH", "/usr/local/bin:/usr/bin:/bin");
+    var sup = try testSupervisor(gpa, &cfg, dir, threaded.io(), &environ);
+    defer sup.deinit();
+
+    const exited = struct {
+        fn f(s: *Supervisor) bool {
+            return s.workers[0].state == .exited;
+        }
+    }.f;
+    try testing.expect(try stepUntil(&sup, 10_000, exited));
+    try shutDown(&sup);
+
+    const a = &sup.workers[0].archive;
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("up", a.lineInto(0, &buf));
+    var buf2: [64]u8 = undefined;
+    try testing.expectEqualStrings("cleaned", a.lineInto(a.lastLineStart(), &buf2));
+}
+
+test "stop.command runs before the stop signal is sent" {
+    const gpa = testing.allocator;
+    const dir = try tempDir(gpa, "stoporder");
+    defer gpa.free(dir);
+
+    const src = try std.fmt.allocPrint(gpa,
+        \\[services.svc]
+        \\run = "trap 'echo got-term >> {s}/order; exit 0' TERM; echo ready; sleep 60 & wait"
+        \\stop.command = "echo stop-command >> {s}/order; sleep 0.3"
+        \\stop.timeout = 5
+        \\
+    , .{ dir, dir });
+    defer gpa.free(src);
+    var cfg = try loadCfg(gpa, src);
+    defer cfg.deinit();
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var environ: std.process.Environ.Map = .init(gpa);
+    defer environ.deinit();
+    try environ.put("PATH", "/usr/local/bin:/usr/bin:/bin");
+    var sup = try testSupervisor(gpa, &cfg, dir, threaded.io(), &environ);
+    defer sup.deinit();
+
+    const started = struct {
+        fn f(s: *Supervisor) bool {
+            return s.workers[0].archive.len() > 0;
+        }
+    }.f;
+    try testing.expect(try stepUntil(&sup, 10_000, started));
+    try shutDown(&sup);
+    try testing.expectEqual(State.stopped, sup.workers[0].state);
+
+    const path = try std.fmt.allocPrint(gpa, "{s}/order", .{dir});
+    defer gpa.free(path);
+    const text = try std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, gpa, .limited(4096));
+    defer gpa.free(text);
+    try testing.expectEqualStrings("stop-command\ngot-term\n", text);
+}
+
+test "a watched path restarts the Worker after the debounce" {
+    const gpa = testing.allocator;
+    const dir = try tempDir(gpa, "watch");
+    defer gpa.free(dir);
+    const watched = try std.fmt.allocPrint(gpa, "{s}/src", .{dir});
+    defer gpa.free(watched);
+    try os.makePath(watched);
+
+    const src = try std.fmt.allocPrint(gpa,
+        \\[services.app]
+        \\run = "echo started; sleep 60"
+        \\stop.timeout = 1
+        \\watch = {{ paths = ["{s}"], debounce = "50ms" }}
+        \\
+    , .{watched});
+    defer gpa.free(src);
+    var cfg = try loadCfg(gpa, src);
+    defer cfg.deinit();
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var environ: std.process.Environ.Map = .init(gpa);
+    defer environ.deinit();
+    try environ.put("PATH", "/usr/local/bin:/usr/bin:/bin");
+    var sup = try testSupervisor(gpa, &cfg, dir, threaded.io(), &environ);
+    defer sup.deinit();
+    try testing.expectEqual(@as(usize, 0), sup.watcher.problems.items.len);
+
+    const up = struct {
+        fn f(s: *Supervisor) bool {
+            return s.workers[0].state == .running and s.workers[0].archive.len() > 0;
+        }
+    }.f;
+    try testing.expect(try stepUntil(&sup, 10_000, up));
+    try testing.expectEqual(@as(u32, 0), sup.workers[0].restarts);
+
+    const file = try std.fmt.allocPrintSentinel(gpa, "{s}/changed.txt", .{watched}, 0);
+    defer gpa.free(file);
+    const fd = try os.open(file.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644);
+    try os.writeAll(fd, "x");
+    os.close(fd);
+
+    const restarted = struct {
+        fn f(s: *Supervisor) bool {
+            return s.workers[0].restarts >= 1 and s.workers[0].state == .running and
+                s.workers[0].archive.len() > "started\n".len;
+        }
+    }.f;
+    try testing.expect(try stepUntil(&sup, 10_000, restarted));
+    try shutDown(&sup);
+}
+
+test "colour defaults are the lowest layer and NO_COLOR removes them" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var environ: std.process.Environ.Map = .init(gpa);
+    defer environ.deinit();
+    try environ.put("PATH", "/bin");
+
+    const plain_spec: config.Worker = .{ .name = "a", .group = "a", .command = "true" };
+    const explicit: config.Worker = .{
+        .name = "b",
+        .group = "b",
+        .command = "true",
+        .env = &.{"FORCE_COLOR=0"},
+    };
+    const opts: Options = .{
+        .io = threaded.io(),
+        .environ = &environ,
+        .base_dir = "/",
+        .log_dir = "/",
+    };
+
+    const has = struct {
+        fn f(envp: [*:null]const ?[*:0]const u8, entry: []const u8) bool {
+            var i: usize = 0;
+            while (envp[i]) |e| : (i += 1) {
+                if (std.mem.eql(u8, std.mem.span(e), entry)) return true;
+            }
+            return false;
+        }
+        fn hasKey(envp: [*:null]const ?[*:0]const u8, key: []const u8) bool {
+            var i: usize = 0;
+            while (envp[i]) |e| : (i += 1) {
+                if (std.mem.startsWith(u8, std.mem.span(e), key) and
+                    std.mem.span(e).len > key.len and std.mem.span(e)[key.len] == '=') return true;
+            }
+            return false;
+        }
+    };
+
+    const on = try buildEnv(arena, opts, &plain_spec, true, null, gpa);
+    try testing.expect(has.f(on, "FORCE_COLOR=1"));
+    try testing.expect(has.f(on, "CLICOLOR_FORCE=1"));
+
+    const off = try buildEnv(arena, opts, &plain_spec, false, null, gpa);
+    try testing.expect(!has.hasKey(off, "FORCE_COLOR"));
+
+    // An explicit value in the config beats the default.
+    const kept = try buildEnv(arena, opts, &explicit, true, null, gpa);
+    try testing.expect(has.f(kept, "FORCE_COLOR=0"));
+    try testing.expect(!has.f(kept, "FORCE_COLOR=1"));
+
+    try environ.put("NO_COLOR", "1");
+    const muted = try buildEnv(arena, opts, &plain_spec, true, null, gpa);
+    try testing.expect(!has.hasKey(muted, "FORCE_COLOR"));
+    try testing.expect(!has.hasKey(muted, "CLICOLOR_FORCE"));
+    // ...but a value written in the config is still honoured.
+    const mixed = try buildEnv(arena, opts, &explicit, true, null, gpa);
+    try testing.expect(has.f(mixed, "FORCE_COLOR=0"));
+    try testing.expect(!has.hasKey(mixed, "CLICOLOR_FORCE"));
+}
+
 test "State classifies terminal and alive without overlap" {
-    for ([_]State{ .exited, .failed, .skipped }) |s| {
+    for ([_]State{ .exited, .failed, .skipped, .off }) |s| {
         try testing.expect(s.terminal());
         try testing.expect(!s.alive());
     }

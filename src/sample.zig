@@ -297,17 +297,18 @@ pub const Sampler = struct {
     /// children go unseen.
     fn pushChildren(self: *Sampler, pid: Pid) void {
         var path: [64]u8 = undefined;
-        const tasks_path = std.fmt.bufPrintZ(&path, "/proc/{d}/task", .{pid}) catch return;
+        const tasks_path = std.fmt.bufPrintSentinel(&path, "/proc/{d}/task", .{pid}, 0) catch return;
         var tasks = os.DirIter.open(tasks_path) catch return;
         defer tasks.close();
 
         while (tasks.next()) |entry| {
             const tid = std.fmt.parseInt(Pid, entry, 10) catch continue;
             var child_path: [80]u8 = undefined;
-            const p = std.fmt.bufPrintZ(
+            const p = std.fmt.bufPrintSentinel(
                 &child_path,
                 "/proc/{d}/task/{d}/children",
                 .{ pid, tid },
+                0,
             ) catch continue;
 
             var buf: [4096]u8 = undefined;
@@ -497,7 +498,7 @@ const pss_per_tick = 3;
 fn childrenSupported() bool {
     const pid = os.linux.getpid();
     var path: [80]u8 = undefined;
-    const p = std.fmt.bufPrintZ(&path, "/proc/{d}/task/{d}/children", .{ pid, pid }) catch
+    const p = std.fmt.bufPrintSentinel(&path, "/proc/{d}/task/{d}/children", .{ pid, pid }, 0) catch
         return false;
     const fd = os.open(p, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0) catch return false;
     os.close(fd);
@@ -542,7 +543,7 @@ const ProcStat = struct {
 
 fn readStat(pid: Pid) ?ProcStat {
     var path: [64]u8 = undefined;
-    const p = std.fmt.bufPrintZ(&path, "/proc/{d}/stat", .{pid}) catch return null;
+    const p = std.fmt.bufPrintSentinel(&path, "/proc/{d}/stat", .{pid}, 0) catch return null;
     var buf: [1024]u8 = undefined;
     const text = readSmallFile(p, &buf) orelse return null;
     return parseStat(text);
@@ -617,7 +618,7 @@ fn parseStat(text: []const u8) ?ProcStat {
 /// stays on `stat` and is still read for every pid every tick.
 fn readPss(pid: Pid) ?u64 {
     var path: [64]u8 = undefined;
-    const p = std.fmt.bufPrintZ(&path, "/proc/{d}/smaps_rollup", .{pid}) catch return null;
+    const p = std.fmt.bufPrintSentinel(&path, "/proc/{d}/smaps_rollup", .{pid}, 0) catch return null;
     // The file is around 700 bytes and `Pss:` is its third line.
     var buf: [2048]u8 = undefined;
     const text = readSmallFile(p, &buf) orelse return null;
@@ -649,7 +650,7 @@ const Io = struct { read: u64 = 0, write: u64 = 0 };
 /// reports zero, and zero I/O is a better answer than no Sample at all.
 fn readIo(pid: Pid) Io {
     var path: [64]u8 = undefined;
-    const p = std.fmt.bufPrintZ(&path, "/proc/{d}/io", .{pid}) catch return .{};
+    const p = std.fmt.bufPrintSentinel(&path, "/proc/{d}/io", .{pid}, 0) catch return .{};
     var buf: [512]u8 = undefined;
     const text = readSmallFile(p, &buf) orelse return .{};
 
@@ -805,7 +806,7 @@ test "parseTrailingKb reads a smaps_rollup line without its unit" {
 /// where the two numbers should be closest.
 fn readRollupRss(pid: Pid) ?u64 {
     var path: [64]u8 = undefined;
-    const p = std.fmt.bufPrintZ(&path, "/proc/{d}/smaps_rollup", .{pid}) catch return null;
+    const p = std.fmt.bufPrintSentinel(&path, "/proc/{d}/smaps_rollup", .{pid}, 0) catch return null;
     var buf: [2048]u8 = undefined;
     const text = readSmallFile(p, &buf) orelse return null;
     var lines = std.mem.tokenizeScalar(u8, text, '\n');

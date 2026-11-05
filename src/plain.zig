@@ -137,6 +137,7 @@ pub const Printer = struct {
                 .signaled => |s| try out.print("killed by {t}", .{s}),
             } else try out.writeAll("failed to start"),
             .skipped => try out.writeAll("skipped: a dependency will never be satisfied"),
+            .off => try out.writeAll("off"),
         }
         if (self.colour) try out.writeAll(reset);
         try out.writeAll("\n");
@@ -156,6 +157,7 @@ pub const Printer = struct {
                     .signaled => |s| try out.print("  {t}", .{s}),
                 } else try out.writeAll("  did not start"),
                 .skipped => try out.writeAll("  skipped"),
+                .off => try out.writeAll("  off"),
                 else => try out.print("  {t}", .{w.state}),
             }
             if (w.archive.write_failed) try out.writeAll("  (Archive incomplete)");

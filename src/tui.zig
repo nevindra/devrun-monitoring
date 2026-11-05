@@ -114,6 +114,12 @@ pub fn run(
             if (opts.pruned == 1) "" else "s",
         });
     }
+    // The footer has room for one message, so the first problem is named and
+    // the rest are counted. The plain view prints every one.
+    if (sup.watcher.problems.items.len > 0) {
+        const probs = sup.watcher.problems.items;
+        ui.setStatus("", "watch: {s}{s}", .{ probs[0], if (probs.len > 1) " (and more)" else "" });
+    }
 
     while (true) {
         try ui.render();
@@ -141,6 +147,9 @@ pub fn run(
     // reader's real screen rather than on one about to be discarded.
     ui.leave();
     ui.reportCleaned();
+    // `exit-on-end` makes one Worker's status the Session's, as it does in
+    // the plain view.
+    if (sup.ended_by) |i| return supervisor.exitStatus(sup.workers[i].exit);
     return ui.exit_code;
 }
 
@@ -1283,12 +1292,11 @@ const Ui = struct {
         var right: std.Io.Writer = .fixed(&right_buf);
         var ram_buf: [32]u8 = undefined;
         try right.print("{d} of {d} {s}running{s}   {s}RAM{s} {s}   {s}CPU{s} {d:.1}% ", .{
-            running,                 self.sup.workers.len,
-            esc.dim,                 esc.weight_off,
-            esc.dim,                 esc.weight_off,
-            humanBytes(&ram_buf, ram),
-            esc.dim,                 esc.weight_off,
-            cpu,
+            running,                   self.sup.workers.len,
+            esc.dim,                   esc.weight_off,
+            esc.dim,                   esc.weight_off,
+            humanBytes(&ram_buf, ram), esc.dim,
+            esc.weight_off,            cpu,
         });
 
         const cols: usize = self.size.cols;
@@ -1838,7 +1846,7 @@ fn shedClause(text: []const u8, room: usize) []const u8 {
 
 /// A run of box-drawing dashes, sliced rather than looped, so a border is one
 /// `writeAll` instead of a hundred.
-const dashes = "─" ** 256;
+const dashes = term.repeat("─", 256);
 /// `─` is three bytes, and every slice of `dashes` has to land on a boundary
 /// between them — a border cut mid-glyph puts a replacement character on
 /// screen and knocks every column after it out of line.
@@ -1940,7 +1948,7 @@ fn exitText(buf: []u8, exit: ?os.Exit) []const u8 {
             .INT => "interrupt",
             .SEGV => "segfault",
             .ABRT => "aborted",
-            else => std.fmt.bufPrint(buf, "signal {d}", .{@intFromEnum(sig)}) catch "?",
+            else => std.fmt.bufPrint(buf, "signal {d}", .{@backingInt(sig)}) catch "?",
         },
     };
 }
@@ -1980,6 +1988,7 @@ fn stateGlyph(s: supervisor.State) []const u8 {
         .stopped => "■",
         .failed => "✗",
         .skipped => "·",
+        .off => "◌",
     };
 }
 
@@ -1996,6 +2005,7 @@ fn stateLabel(s: supervisor.State) []const u8 {
         .stopped => "stopped",
         .failed => "failed",
         .skipped => "skipped",
+        .off => "off",
     };
 }
 
@@ -2009,6 +2019,7 @@ fn stateColour(s: supervisor.State) []const u8 {
         .stopped => paint.stopped,
         .failed => paint.failed,
         .skipped => paint.skipped,
+        .off => paint.skipped,
     };
 }
 
@@ -2121,11 +2132,10 @@ const Fixture = struct {
         try environ.put("PATH", "/usr/local/bin:/usr/bin:/bin");
 
         self.cfg = try config.loadSource(gpa,
-            \\processes:
-            \\  api:
-            \\    command: "true"
-            \\  web:
-            \\    command: "true"
+            \\[services.api]
+            \\run = "true"
+            \\[services.web]
+            \\run = "true"
         , "/nonexistent", .{ .io = threaded.io(), .environ = &environ }, null);
         errdefer self.cfg.deinit();
 
@@ -2159,10 +2169,10 @@ const Fixture = struct {
         self.cfg.deinit();
         _ = store.clean(gpa, self.root, .all);
         var buf: [4096]u8 = undefined;
-        if (std.fmt.bufPrintZ(&buf, "{s}/api.log", .{self.dir})) |p| os.unlink(p.ptr) else |_| {}
-        if (std.fmt.bufPrintZ(&buf, "{s}/web.log", .{self.dir})) |p| os.unlink(p.ptr) else |_| {}
-        if (std.fmt.bufPrintZ(&buf, "{s}", .{self.root})) |p| os.rmdir(p.ptr) else |_| {}
-        if (std.fmt.bufPrintZ(&buf, "{s}", .{self.dir})) |p| os.rmdir(p.ptr) else |_| {}
+        if (std.fmt.bufPrintSentinel(&buf, "{s}/api.log", .{self.dir}, 0)) |p| os.unlink(p.ptr) else |_| {}
+        if (std.fmt.bufPrintSentinel(&buf, "{s}/web.log", .{self.dir}, 0)) |p| os.unlink(p.ptr) else |_| {}
+        if (std.fmt.bufPrintSentinel(&buf, "{s}", .{self.root}, 0)) |p| os.rmdir(p.ptr) else |_| {}
+        if (std.fmt.bufPrintSentinel(&buf, "{s}", .{self.dir}, 0)) |p| os.rmdir(p.ptr) else |_| {}
         gpa.free(self.root);
         gpa.free(self.dir);
         gpa.destroy(self);
@@ -2175,7 +2185,7 @@ const Fixture = struct {
             const dir = try store.openSession(self.gpa, self.root, 1786703525 + @as(i64, @intCast(k)));
             defer self.gpa.free(dir);
             var buf: [4096]u8 = undefined;
-            const file = try std.fmt.bufPrintZ(&buf, "{s}/api.log", .{dir});
+            const file = try std.fmt.bufPrintSentinel(&buf, "{s}/api.log", .{dir}, 0);
             const fd = try os.open(file.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644);
             defer os.close(fd);
             try os.writeAll(fd, "saved output\n");
@@ -2474,7 +2484,7 @@ test "stateColour gives every state a distinct colour" {
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     defer seen.deinit(testing.allocator);
     for ([_]supervisor.State{
-        .pending, .running, .ready, .stopping, .exited, .stopped, .failed, .skipped,
+        .pending, .running, .ready, .stopping, .exited, .stopped, .failed, .skipped, .off,
     }) |s| {
         const c = stateColour(s);
         // failed and running must never be confusable at a glance.
@@ -2498,7 +2508,7 @@ test "every state is said as a shape and a word as well as a colour" {
     defer words.deinit(testing.allocator);
 
     const all = [_]supervisor.State{
-        .pending, .running, .ready, .stopping, .exited, .stopped, .failed, .skipped,
+        .pending, .running, .ready, .stopping, .exited, .stopped, .failed, .skipped, .off,
     };
     for (all) |s| {
         try glyphs.put(testing.allocator, stateGlyph(s), {});
@@ -2532,8 +2542,8 @@ test "humanBytes never outgrows the column reserved for it" {
     // wider than the column would push the whole row sideways.
     var buf: [32]u8 = undefined;
     for ([_]u64{
-        0,           999,          1000,             999_999,
-        1_000_000,   9_999_999,    10_000_000,       999_999_999,
+        0,             999,                  1000,       999_999,
+        1_000_000,     9_999_999,            10_000_000, 999_999_999,
         1_000_000_000, std.math.maxInt(u64),
     }) |n| {
         try testing.expect(humanBytes(&buf, n).len <= Layout.memory_w - 1);
@@ -2607,8 +2617,8 @@ test "exit says what happened, not just a number" {
     try testing.expectEqualStrings("segfault", exitText(&buf, .{ .signaled = .SEGV }));
 
     for ([_]?os.Exit{
-        null,                        .{ .exited = 0 },      .{ .exited = 255 },
-        .{ .signaled = .KILL },      .{ .signaled = .SEGV }, .{ .signaled = .INT },
+        null,                   .{ .exited = 0 },       .{ .exited = 255 },
+        .{ .signaled = .KILL }, .{ .signaled = .SEGV }, .{ .signaled = .INT },
     }) |e| {
         try testing.expect(exitText(&buf, e).len <= Layout.exit_w - 1);
     }

@@ -501,8 +501,8 @@ test "Window keeps the newest bytes and reports what it dropped" {
 /// real rather than mocked.
 fn testArchive(window_bytes: usize) !struct { Archive, [:0]const u8 } {
     var name_buf: [64]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/devrun-test-{d}.log", .{os.nowMs()});
-    const path = try testing.allocator.dupeZ(u8, name);
+    const name = try std.fmt.bufPrintSentinel(&name_buf, "/tmp/devrun-test-{d}.log", .{os.nowMs()}, 0);
+    const path = try testing.allocator.dupeSentinel(u8, name, 0);
     const a = try Archive.create(testing.allocator, path.ptr, null, window_bytes);
     return .{ a, path };
 }
@@ -587,8 +587,8 @@ test "bytes are kept byte-faithful, ANSI and all" {
 
 test "an Index answers both directions, and rounds outwards on time" {
     var name_buf: [64]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/devrun-idx-{d}.idx", .{os.nowMs()});
-    const path = try testing.allocator.dupeZ(u8, name);
+    const name = try std.fmt.bufPrintSentinel(&name_buf, "/tmp/devrun-idx-{d}.idx", .{os.nowMs()}, 0);
+    const path = try testing.allocator.dupeSentinel(u8, name, 0);
     defer {
         os.unlink(path.ptr);
         testing.allocator.free(path);
@@ -642,8 +642,8 @@ test "a missing or foreign Index reads as empty rather than failing" {
     // A file that exists but is not ours: refused by magic, not misread. A
     // wrong offset here would silently print the wrong slice of a log.
     var name_buf: [64]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&name_buf, "/tmp/devrun-notidx-{d}", .{os.nowMs()});
-    const path = try testing.allocator.dupeZ(u8, name);
+    const name = try std.fmt.bufPrintSentinel(&name_buf, "/tmp/devrun-notidx-{d}", .{os.nowMs()}, 0);
+    const path = try testing.allocator.dupeSentinel(u8, name, 0);
     defer {
         os.unlink(path.ptr);
         testing.allocator.free(path);
@@ -659,7 +659,7 @@ test "a missing or foreign Index reads as empty rather than failing" {
 
 test "an Archive stamps every chunk it appends" {
     var name_buf: [64]u8 = undefined;
-    const stem = try std.fmt.bufPrintZ(&name_buf, "/tmp/devrun-arc-{d}", .{os.nowMs()});
+    const stem = try std.fmt.bufPrintSentinel(&name_buf, "/tmp/devrun-arc-{d}", .{os.nowMs()}, 0);
     const log = try std.fmt.allocPrintSentinel(testing.allocator, "{s}.log", .{stem}, 0);
     const idx = try std.fmt.allocPrintSentinel(testing.allocator, "{s}.idx", .{stem}, 0);
     defer {

@@ -184,19 +184,28 @@ pub fn handle(line: []const u8, sup: *Supervisor, w: *std.Io.Writer) void {
         w.print("error: {s} needs a process name\n", .{verb}) catch {};
         return;
     };
-    const i = sup.cfg.find(name) orelse {
-        w.print("error: \"{s}\" is not a process in this config\n", .{name}) catch {};
-        return;
-    };
+    const act: enum { start, stop, restart } =
+        if (std.mem.eql(u8, verb, "start")) .start else if (std.mem.eql(u8, verb, "stop")) .stop else if (std.mem.eql(u8, verb, "restart")) .restart else {
+            w.print("error: unknown command \"{s}\"\n", .{verb}) catch {};
+            return;
+        };
 
-    if (std.mem.eql(u8, verb, "start")) {
-        sup.startWorker(i);
-    } else if (std.mem.eql(u8, verb, "stop")) {
-        sup.stopWorker(i);
-    } else if (std.mem.eql(u8, verb, "restart")) {
-        sup.restartWorker(i);
-    } else {
-        w.print("error: unknown command \"{s}\"\n", .{verb}) catch {};
+    // An exact Worker name wins. Otherwise the name is a service, and the
+    // verb applies to every replica of it: `restart worker` means all of
+    // `worker.1` to `worker.N`.
+    var hit = false;
+    for (sup.cfg.workers, 0..) |spec, i| {
+        const exact = std.mem.eql(u8, spec.name, name);
+        if (!exact and (sup.cfg.find(name) != null or !std.mem.eql(u8, spec.group, name))) continue;
+        hit = true;
+        switch (act) {
+            .start => sup.startWorker(i),
+            .stop => sup.stopWorker(i),
+            .restart => sup.restartWorker(i),
+        }
+    }
+    if (!hit) {
+        w.print("error: \"{s}\" is not a process in this config\n", .{name}) catch {};
         return;
     }
     w.print("ok {s} {s}\n", .{ verb, name }) catch {};
@@ -317,7 +326,7 @@ test "an unknown process is refused by name rather than ignored" {
 test "a socket path longer than sun_path is refused, not truncated" {
     // Silently truncating would bind a different path than the client
     // connects to, and the failure would look like "no Session is running".
-    const long = "/tmp/" ++ ("x" ** 200) ++ "/control.sock";
+    const long = "/tmp/" ++ @as([200]u8, @splat('x')) ++ "/control.sock";
     try testing.expectError(error.NameTooLong, sockaddrUn(long));
 
     const ok = try sockaddrUn("/tmp/devrun-test/control.sock");
@@ -325,4 +334,69 @@ test "a socket path longer than sun_path is refused, not truncated" {
         "/tmp/devrun-test/control.sock",
         std.mem.sliceTo(&ok.path, 0),
     );
+}
+
+test "a service name acts on every replica, and an unknown one is still an error" {
+    const gpa = testing.allocator;
+    const config = @import("config.zig");
+
+    const dir = try std.fmt.allocPrint(gpa, "/tmp/devrun-ctl-test-{d}", .{os.nowMs()});
+    defer gpa.free(dir);
+    try os.makePath(dir);
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var environ: std.process.Environ.Map = .init(gpa);
+    defer environ.deinit();
+    try environ.put("PATH", "/usr/local/bin:/usr/bin:/bin");
+
+    var cfg = try config.loadSource(gpa,
+        \\[services.worker]
+        \\run = "sleep 60"
+        \\replicas = 2
+        \\stop.timeout = 1
+        \\[services.other]
+        \\run = "sleep 60"
+        \\stop.timeout = 1
+        \\
+    , "/nonexistent", .{ .io = threaded.io(), .environ = &environ }, null);
+    defer cfg.deinit();
+
+    var sup = try Supervisor.init(gpa, &cfg, .{
+        .io = threaded.io(),
+        .environ = &environ,
+        .base_dir = dir,
+        .log_dir = dir,
+    }, null);
+    defer sup.deinit();
+
+    const deadline = os.nowMs() + 5000;
+    while (os.nowMs() < deadline) {
+        var all = true;
+        for (sup.workers) |w| all = all and w.state == .running;
+        if (all) break;
+        try sup.step(&.{}, 25);
+    }
+
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    handle("restart worker", &sup, &w);
+    try testing.expectEqualStrings("ok restart worker\n", w.buffered());
+    try testing.expectEqual(supervisor.State.stopping, sup.workers[0].state);
+    try testing.expectEqual(supervisor.State.stopping, sup.workers[1].state);
+    try testing.expectEqual(supervisor.State.running, sup.workers[2].state);
+
+    // One replica by its exact name touches only that one.
+    var w2: std.Io.Writer = .fixed(&buf);
+    handle("stop other", &sup, &w2);
+    try testing.expectEqual(supervisor.State.stopping, sup.workers[2].state);
+
+    var w3: std.Io.Writer = .fixed(&buf);
+    handle("restart nothing", &sup, &w3);
+    try testing.expect(std.mem.startsWith(u8, w3.buffered(), "error:"));
+
+    sup.beginShutdown();
+    const end = os.nowMs() + 10_000;
+    while (!sup.done() and os.nowMs() < end) try sup.step(&.{}, 25);
+    try testing.expect(sup.done());
 }

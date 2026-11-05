@@ -9,9 +9,9 @@
 //! loop, which is why a hung probe on one Worker cannot stall another Worker's
 //! logs.
 //!
-//! Attempt bookkeeping follows process-compose: `success_threshold` consecutive
-//! passes make a Worker Ready, `failure_threshold` consecutive failures make it
-//! unhealthy, and either counter resets when the other side scores.
+//! Attempt bookkeeping: `successes` consecutive passes make a Worker Ready,
+//! `failures` consecutive failures make it unhealthy, and either counter
+//! resets when the other side scores.
 
 const std = @import("std");
 const os = @import("os.zig");
@@ -20,9 +20,10 @@ const config = @import("config.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Error = error{
-    /// `scheme: https` is in the config. Terminating TLS to probe a local dev
-    /// service is not something devrun does, and quietly probing it over plain
-    /// HTTP instead would be the silent divergence this project refuses.
+    /// An https URL reached the probe. The config refuses one first, so this
+    /// is the backstop: terminating TLS to probe a local dev service is not
+    /// something devrun does, and quietly probing over plain HTTP instead
+    /// would be the silent divergence this project refuses.
     HttpsProbeUnsupported,
     /// The host is neither an IPv4 literal nor `localhost`. devrun does not
     /// resolve names for probes — a resolver in the event loop is a blocking
@@ -62,6 +63,8 @@ pub const Probe = struct {
     exec_path: ?[*:0]const u8 = null,
     http_addr: os.linux.sockaddr.in = undefined,
     http_request: []const u8 = &.{},
+    /// `ready.status`: the one code that passes. Null accepts any 2xx or 3xx.
+    http_status: ?u16 = null,
 
     attempt: Attempt = .none,
     /// When the current attempt gives up.
@@ -73,7 +76,7 @@ pub const Probe = struct {
     failures: u32 = 0,
 
     /// True once `success_threshold` consecutive attempts passed. This is what
-    /// `process_healthy` waits on.
+    /// `after = { x = "ready" }` waits on.
     ready: bool = false,
     /// True once `failure_threshold` consecutive attempts failed. Reported,
     /// not acted on: a Worker that fails its probe is still running, and
@@ -104,8 +107,8 @@ pub const Probe = struct {
                 // probe that works when pasted into a terminal works here.
                 const argv = try arena.allocSentinel(?[*:0]const u8, 3, null);
                 argv[0] = shell.path;
-                argv[1] = (try arena.dupeZ(u8, shell.argument)).ptr;
-                argv[2] = (try arena.dupeZ(u8, command)).ptr;
+                argv[1] = (try arena.dupeSentinel(u8, shell.argument, 0)).ptr;
+                argv[2] = (try arena.dupeSentinel(u8, command, 0)).ptr;
                 p.exec_path = shell.path;
                 p.exec_argv = argv.ptr;
             },
@@ -116,6 +119,7 @@ pub const Probe = struct {
                     .port = std.mem.nativeToBig(u16, h.port),
                     .addr = ip,
                 };
+                p.http_status = h.status;
                 p.http_request = try std.fmt.allocPrint(
                     arena,
                     "GET {s} HTTP/1.1\r\nHost: {s}:{d}\r\nUser-Agent: devrun\r\n" ++
@@ -240,7 +244,7 @@ pub const Probe = struct {
                 };
                 if (n == 0) return self.finishHttp(.fail); // closed before answering
                 h.got_len += n;
-                if (statusLineVerdict(h.got[0..h.got_len])) |v| return self.finishHttp(v);
+                if (statusLineVerdict(h.got[0..h.got_len], self.http_status)) |v| return self.finishHttp(v);
                 // The buffer only ever holds a status line; if it filled
                 // without one appearing, this is not an HTTP server.
                 if (h.got_len == h.got.len) return self.finishHttp(.fail);
@@ -332,9 +336,10 @@ pub const Probe = struct {
     }
 };
 
-/// A 2xx or 3xx is ready; anything else is not. Returns null while the status
-/// line is still incomplete.
-fn statusLineVerdict(buf: []const u8) ?Verdict {
+/// With `want` set, only that exact code is ready. Otherwise a 2xx or 3xx is
+/// ready and anything else is not. Returns null while the status line is still
+/// incomplete.
+fn statusLineVerdict(buf: []const u8, want: ?u16) ?Verdict {
     const eol = std.mem.indexOfScalar(u8, buf, '\n') orelse return null;
     const line = buf[0..eol];
     const sp = std.mem.indexOfScalar(u8, line, ' ') orelse return .fail;
@@ -342,6 +347,7 @@ fn statusLineVerdict(buf: []const u8) ?Verdict {
     const rest = std.mem.trimStart(u8, line[sp..], " ");
     if (rest.len < 3) return .fail;
     const code = std.fmt.parseInt(u16, rest[0..3], 10) catch return .fail;
+    if (want) |exact| return if (code == exact) .pass else .fail;
     return if (code >= 200 and code < 400) .pass else .fail;
 }
 
@@ -371,17 +377,26 @@ fn parseIp4(host: []const u8) Error!u32 {
 const testing = std.testing;
 
 test "an HTTP status line decides readiness, and a partial one decides nothing" {
-    try testing.expectEqual(Verdict.pass, statusLineVerdict("HTTP/1.1 200 OK\r\n").?);
-    try testing.expectEqual(Verdict.pass, statusLineVerdict("HTTP/1.1 204 No Content\r\n").?);
+    try testing.expectEqual(Verdict.pass, statusLineVerdict("HTTP/1.1 200 OK\r\n", null).?);
+    try testing.expectEqual(Verdict.pass, statusLineVerdict("HTTP/1.1 204 No Content\r\n", null).?);
     // A redirect means something is listening and answering, which is what a
     // readiness probe is asking.
-    try testing.expectEqual(Verdict.pass, statusLineVerdict("HTTP/1.1 301 Moved\r\n").?);
-    try testing.expectEqual(Verdict.fail, statusLineVerdict("HTTP/1.1 404 Not Found\r\n").?);
-    try testing.expectEqual(Verdict.fail, statusLineVerdict("HTTP/1.1 503 Unavailable\r\n").?);
+    try testing.expectEqual(Verdict.pass, statusLineVerdict("HTTP/1.1 301 Moved\r\n", null).?);
+    try testing.expectEqual(Verdict.fail, statusLineVerdict("HTTP/1.1 404 Not Found\r\n", null).?);
+    try testing.expectEqual(Verdict.fail, statusLineVerdict("HTTP/1.1 503 Unavailable\r\n", null).?);
     // Something is listening, but it does not speak HTTP.
-    try testing.expectEqual(Verdict.fail, statusLineVerdict("SSH-2.0-OpenSSH_9.6\n").?);
+    try testing.expectEqual(Verdict.fail, statusLineVerdict("SSH-2.0-OpenSSH_9.6\n", null).?);
     // Still arriving: no verdict yet, rather than a wrong one.
-    try testing.expect(statusLineVerdict("HTTP/1.1 20") == null);
+    try testing.expect(statusLineVerdict("HTTP/1.1 20", null) == null);
+}
+
+test "ready.status passes only on the exact code" {
+    try testing.expectEqual(Verdict.pass, statusLineVerdict("HTTP/1.1 204 No Content\r\n", 204).?);
+    // A 200 is a success to the default rule, but not the one asked for.
+    try testing.expectEqual(Verdict.fail, statusLineVerdict("HTTP/1.1 200 OK\r\n", 204).?);
+    // And the other way: an exact 404 is a pass when 404 is what was asked.
+    try testing.expectEqual(Verdict.pass, statusLineVerdict("HTTP/1.1 404 Not Found\r\n", 404).?);
+    try testing.expect(statusLineVerdict("HTTP/1.1 20", 200) == null);
 }
 
 test "parseIp4 accepts literals and localhost, and refuses names" {

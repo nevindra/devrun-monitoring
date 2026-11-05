@@ -480,11 +480,11 @@ pub fn openSources(
     for (sources, names) |*s, name| {
         var log_buf: [4096]u8 = undefined;
         var idx_buf: [4096]u8 = undefined;
-        const log = std.fmt.bufPrintZ(&log_buf, "{s}/{s}.log", .{ log_dir, name }) catch {
+        const log = std.fmt.bufPrintSentinel(&log_buf, "{s}/{s}.log", .{ log_dir, name }, 0) catch {
             s.* = .{ .name = name };
             continue;
         };
-        const idx = std.fmt.bufPrintZ(&idx_buf, "{s}/{s}.idx", .{ log_dir, name }) catch {
+        const idx = std.fmt.bufPrintSentinel(&idx_buf, "{s}/{s}.idx", .{ log_dir, name }, 0) catch {
             s.* = .{ .name = name };
             continue;
         };
@@ -762,8 +762,8 @@ test "parseDuration takes the units people type and refuses the rest" {
 fn writeFixture(dir: []const u8, name: []const u8, chunks: []const struct { u64, []const u8 }) !void {
     var log_buf: [512]u8 = undefined;
     var idx_buf: [512]u8 = undefined;
-    const log_path = try std.fmt.bufPrintZ(&log_buf, "{s}/{s}.log", .{ dir, name });
-    const idx_path = try std.fmt.bufPrintZ(&idx_buf, "{s}/{s}.idx", .{ dir, name });
+    const log_path = try std.fmt.bufPrintSentinel(&log_buf, "{s}/{s}.log", .{ dir, name }, 0);
+    const idx_path = try std.fmt.bufPrintSentinel(&idx_buf, "{s}/{s}.idx", .{ dir, name }, 0);
 
     var a = try archive.Archive.create(testing.allocator, log_path.ptr, null, 4096);
     defer a.deinit(testing.allocator);
@@ -977,7 +977,7 @@ test "a Worker with no Index still appears, at the back of every tie" {
     // one whose sidecar could not be written. Losing its output entirely would
     // be a much worse answer than losing its position.
     var log_buf: [512]u8 = undefined;
-    const log_path = try std.fmt.bufPrintZ(&log_buf, "{s}/legacy.log", .{dir});
+    const log_path = try std.fmt.bufPrintSentinel(&log_buf, "{s}/legacy.log", .{dir}, 0);
     var a = try archive.Archive.create(testing.allocator, log_path.ptr, null, 4096);
     try os.writeAll(a.fd, "untimed\n");
     a.deinit(testing.allocator);
@@ -1015,7 +1015,7 @@ test "a long line is clipped with the byte count that was cut" {
     }, &w);
 
     try testing.expectEqual(@as(usize, 1), r.truncated);
-    try testing.expectEqualStrings(("x" ** 50) ++ " …+150B\n", w.buffered());
+    try testing.expectEqualStrings(@as([50]u8, @splat('x')) ++ " …+150B\n", w.buffered());
 }
 
 test "a line longer than the read buffer does not swallow the lines after it" {
@@ -1056,7 +1056,7 @@ test "a line longer than the read buffer does not swallow the lines after it" {
     const expected = try std.fmt.bufPrint(
         &expected_buf,
         "{s} …+{d}B\nafter one\nafter two\n",
-        .{ "z" ** 20, giant_len - 20 },
+        .{ @as([20]u8, @splat('z')), giant_len - 20 },
     );
     try testing.expectEqualStrings(expected, w.buffered());
 }

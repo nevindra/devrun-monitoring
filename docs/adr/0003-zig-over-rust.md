@@ -1,6 +1,6 @@
 # Zig, not Rust
 
-devrun is written in Zig 0.16, with libvaxis for the TUI and zig-yaml for config.
+devrun is written in Zig (0.16 when this was decided, 0.17 since), with libvaxis for the TUI and zig-yaml for config. (zig-yaml has since gone with the YAML config; see [0008](0008-devrun-toml.md).)
 
 The technical comparison came out close to even, and far closer than expected. All three arguments that initially favoured Rust failed on inspection: libvaxis targets 0.16 and is as actively maintained as ratatui; zig-yaml handles the plain YAML this config actually uses; and the workload is roughly twelve file descriptors, so neither language needs an async runtime. What remained was one genuine edge each — serde derive versus a hand-written tree walk for config mapping, set against 600–900 lines of proven supervisor code in mandor and its author being reachable.
 

@@ -100,7 +100,7 @@ pub fn list(gpa: Allocator, root: []const u8) ![]Session {
     errdefer found.deinit(gpa);
 
     var root_z: [4096]u8 = undefined;
-    const root_path = std.fmt.bufPrintZ(&root_z, "{s}", .{root}) catch return found.toOwnedSlice(gpa);
+    const root_path = std.fmt.bufPrintSentinel(&root_z, "{s}", .{root}, 0) catch return found.toOwnedSlice(gpa);
 
     var dir = os.DirIter.open(root_path.ptr) catch return found.toOwnedSlice(gpa);
     defer dir.close();
@@ -128,7 +128,7 @@ fn lessByName(_: void, a: Session, b: Session) bool {
 /// pointless.
 fn sessionBytes(root: []const u8, name: []const u8) u64 {
     var path_buf: [4096]u8 = undefined;
-    const dir_path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ root, name }) catch return 0;
+    const dir_path = std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}", .{ root, name }, 0) catch return 0;
     var dir = os.DirIter.open(dir_path.ptr) catch return 0;
     defer dir.close();
 
@@ -136,7 +136,7 @@ fn sessionBytes(root: []const u8, name: []const u8) u64 {
     var file_buf: [4096]u8 = undefined;
     while (dir.next()) |entry| {
         if (std.mem.eql(u8, entry, ".") or std.mem.eql(u8, entry, "..")) continue;
-        const file = std.fmt.bufPrintZ(&file_buf, "{s}/{s}/{s}", .{ root, name, entry }) catch continue;
+        const file = std.fmt.bufPrintSentinel(&file_buf, "{s}/{s}/{s}", .{ root, name, entry }, 0) catch continue;
         total += os.fileBytes(file.ptr);
     }
     return total;
@@ -178,9 +178,9 @@ pub fn openSession(gpa: Allocator, root: []const u8, wall_seconds: i64) ![]const
     // it pointing at something. An absolute link would name a path that only
     // exists on the machine it was made on.
     var link_buf: [4096]u8 = undefined;
-    const link = std.fmt.bufPrintZ(&link_buf, "{s}/{s}", .{ root, latest_link }) catch return dir;
+    const link = std.fmt.bufPrintSentinel(&link_buf, "{s}/{s}", .{ root, latest_link }, 0) catch return dir;
     var target_buf: [stamp_len + 1]u8 = undefined;
-    const target = std.fmt.bufPrintZ(&target_buf, "{s}", .{name}) catch return dir;
+    const target = std.fmt.bufPrintSentinel(&target_buf, "{s}", .{name}, 0) catch return dir;
     // A Session that runs without its symlink is a Session that runs. Failing
     // here would refuse to start a repo's services over a convenience.
     os.relink(target.ptr, link.ptr) catch {};
@@ -198,13 +198,13 @@ pub const Removed = struct {
 /// bigger weapon than this needs.
 fn removeSession(root: []const u8, name: []const u8) void {
     var path_buf: [4096]u8 = undefined;
-    const dir_path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ root, name }) catch return;
+    const dir_path = std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}", .{ root, name }, 0) catch return;
 
     var dir = os.DirIter.open(dir_path.ptr) catch return;
     var file_buf: [4096]u8 = undefined;
     while (dir.next()) |entry| {
         if (std.mem.eql(u8, entry, ".") or std.mem.eql(u8, entry, "..")) continue;
-        const file = std.fmt.bufPrintZ(&file_buf, "{s}/{s}/{s}", .{ root, name, entry }) catch continue;
+        const file = std.fmt.bufPrintSentinel(&file_buf, "{s}/{s}/{s}", .{ root, name, entry }, 0) catch continue;
         os.unlink(file.ptr);
     }
     dir.close();
@@ -244,7 +244,7 @@ pub fn clean(gpa: Allocator, root: []const u8, scope: Scope) Removed {
 
 fn dropLatest(root: []const u8) void {
     var link_buf: [4096]u8 = undefined;
-    const link = std.fmt.bufPrintZ(&link_buf, "{s}/{s}", .{ root, latest_link }) catch return;
+    const link = std.fmt.bufPrintSentinel(&link_buf, "{s}/{s}", .{ root, latest_link }, 0) catch return;
     os.unlink(link.ptr);
 }
 
@@ -311,7 +311,7 @@ fn testRoot(gpa: Allocator, names: []const []const u8, bytes: usize) ![]const u8
         const dir = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ root, n });
         try os.makePath(dir);
         var file_buf: [4096]u8 = undefined;
-        const file = try std.fmt.bufPrintZ(&file_buf, "{s}/{s}/api.log", .{ root, n });
+        const file = try std.fmt.bufPrintSentinel(&file_buf, "{s}/{s}/api.log", .{ root, n }, 0);
         const fd = try os.open(file.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
         defer os.close(fd);
         const filler = try gpa.alloc(u8, bytes);
@@ -325,7 +325,7 @@ fn testRoot(gpa: Allocator, names: []const []const u8, bytes: usize) ![]const u8
 fn tearDown(gpa: Allocator, root: []const u8) void {
     _ = clean(gpa, root, .all);
     var buf: [4096]u8 = undefined;
-    const z = std.fmt.bufPrintZ(&buf, "{s}", .{root}) catch return;
+    const z = std.fmt.bufPrintSentinel(&buf, "{s}", .{root}, 0) catch return;
     os.rmdir(z.ptr);
     gpa.free(root);
 }
@@ -378,21 +378,21 @@ test "latest points at the Session that just started" {
     defer gpa.free(dir);
 
     var link_buf: [4096]u8 = undefined;
-    const link = try std.fmt.bufPrintZ(&link_buf, "{s}/latest/api.log", .{root});
+    const link = try std.fmt.bufPrintSentinel(&link_buf, "{s}/latest/api.log", .{root}, 0);
     const fd = try os.open(link.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644);
     os.close(fd);
 
     // Written through `latest`, read back through the stamped directory: the
     // link is the same place, not a copy of it.
     var real_buf: [4096]u8 = undefined;
-    const real = try std.fmt.bufPrintZ(&real_buf, "{s}/2026-08-14T10-32-05Z/api.log", .{root});
+    const real = try std.fmt.bufPrintSentinel(&real_buf, "{s}/2026-08-14T10-32-05Z/api.log", .{root}, 0);
     const check = try os.open(real.ptr, .{ .ACCMODE = .RDONLY }, 0);
     os.close(check);
 
     // A second Session re-aims it rather than failing on a name that exists.
     const dir2 = try openSession(gpa, root, 1786703526);
     defer gpa.free(dir2);
-    const moved = try std.fmt.bufPrintZ(&link_buf, "{s}/latest/api.log", .{root});
+    const moved = try std.fmt.bufPrintSentinel(&link_buf, "{s}/latest/api.log", .{root}, 0);
     try testing.expectError(error.FileNotFound, os.open(moved.ptr, .{ .ACCMODE = .RDONLY }, 0));
 }
 
@@ -431,7 +431,7 @@ test "clean will not touch a file that is not a Session" {
     _ = clean(gpa, root, .all);
 
     var z_buf: [4096]u8 = undefined;
-    const z = try std.fmt.bufPrintZ(&z_buf, "{s}/keepme", .{root});
+    const z = try std.fmt.bufPrintSentinel(&z_buf, "{s}/keepme", .{root}, 0);
     var still_there = try os.DirIter.open(z.ptr);
     still_there.close();
     os.rmdir(z.ptr);

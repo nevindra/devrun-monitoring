@@ -44,6 +44,7 @@ pub const Row = struct {
     pub fn settled(self: Row) bool {
         return std.mem.eql(u8, self.state, "exited") or
             std.mem.eql(u8, self.state, "stopped") or
+            std.mem.eql(u8, self.state, "off") or
             self.broken();
     }
 
@@ -74,6 +75,8 @@ pub const Row = struct {
         // A Gate that did its job, and a Worker someone stopped on purpose.
         if (std.mem.eql(u8, self.state, "exited")) return true;
         if (std.mem.eql(u8, self.state, "stopped")) return true;
+        // Left out of this run on purpose; nothing to wait for.
+        if (std.mem.eql(u8, self.state, "off")) return true;
         if (!std.mem.eql(u8, self.state, "running")) return false;
 
         return std.mem.eql(u8, self.readiness, "none") or

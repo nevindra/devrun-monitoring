@@ -90,8 +90,8 @@ pub const Terminal = struct {
         t.iflag.INPCK = false;
         t.iflag.ISTRIP = false;
         // A read may return with nothing; the poll loop decides when to read.
-        t.cc[@intFromEnum(linux.V.MIN)] = 0;
-        t.cc[@intFromEnum(linux.V.TIME)] = 0;
+        t.cc[@backingInt(linux.V.MIN)] = 0;
+        t.cc[@backingInt(linux.V.TIME)] = 0;
         _ = linux.ioctl(self.fd, TCSETS, @intFromPtr(&t));
         self.raw = true;
     }
@@ -451,6 +451,17 @@ const Base64Iter = struct {
     }
 };
 
+/// `s` written `n` times, at compile time. Zig 0.17 dropped the `**`
+/// operator that used to do this.
+pub fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+    const out = comptime blk: {
+        var buf: [s.len * n]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        break :blk buf;
+    };
+    return &out;
+}
+
 // ------------------------------------------------------------- tests
 
 const testing = std.testing;
@@ -641,7 +652,7 @@ test "OSC 52 round-trips through base64 without padding in the middle" {
     var buf: [32768]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     // Long enough to cross the internal chunk boundary.
-    const payload = "log line that should reach the clipboard\n" ** 200;
+    const payload = repeat("log line that should reach the clipboard\n", 200);
     try writeOsc52(&w, payload);
 
     const out = w.buffered();

@@ -6,6 +6,107 @@ Newest first. Versions follow [semantic versioning](https://semver.org); until
 Entries say what changed for someone *using* devrun. Refactors, test additions
 and internal tidying stay in the git log, which is where they are useful.
 
+## Unreleased
+
+### Breaking: devrun has its own config
+
+devrun now reads **`devrun.toml`** and no longer reads `process-compose.yaml`
+at all. Every existing config has to be rewritten; the move is mechanical, and
+`devrun config` names the devrun field for every old one it meets.
+
+```toml
+[services.api]
+run   = "pnpm dev"
+after = { migrate = "succeeded" }
+ready = "http://localhost:3000/health"
+```
+
+- `processes` is `services`, `command` is `run`, `working_dir` is `cwd`,
+  `environment` is `env` (a table, not a list), `dotenv` is `env_file`,
+  `depends_on` is `after`, `availability.restart` is `restart`, `shutdown` is
+  `stop`.
+- One `ready` block replaces `readiness_probe` and `ready_log_line`: exactly
+  one of `http`, `exec` or `log`. `http` takes a URL. Timing fields are
+  `delay`, `every`, `timeout`, `successes` and `failures`, and take durations
+  like `"5s"`.
+- Four conditions replace five: `started`, `ready`, `exited`, `succeeded`.
+  `ready` covers what `process_healthy` and `process_log_ready` both meant.
+  `after = ["db"]` waits for `ready` when `db` has a check, `started` when not.
+- Restart policies and `--restart` are spelled with dashes: `on-failure`,
+  `exit-on-failure`. The flag still accepts underscores.
+- `stop.signal` takes a name, `"INT"` or `"SIGINT"`, as well as a number.
+- `run` and `ready.exec` take an array of words as well as a string.
+
+### Building
+
+- Needs Zig 0.17.0 to build from source. 0.16 no longer builds it.
+
+### New in the config
+
+- `[env]` and `env_file` at the top level reach every service.
+- `[templates.<name>]` and `extends` share settings between services.
+- `${VAR:-default}`. Variables now expand per value and only in `env`,
+  `env_file`, `cwd` and `ready.http`; `run` goes to the shell untouched, so
+  `awk '{print $NF}'` is no longer eaten. `.env` is no longer read unless the
+  config names it.
+- Syntax errors say the file, line and column. Unknown fields list the ones
+  that are allowed. `include` and `ready.tcp` are reserved, and say so.
+
+### Replicas, profiles, watching and teardown
+
+```toml
+[services.e2e]
+run     = "pnpm test:e2e"
+after   = { api = "ready" }
+restart = "exit-on-end"
+```
+
+`devrun up --profile e2e` then starts the stack, runs the suite, and exits with
+the suite's exit status.
+
+- `replicas = N` (1 to 64) runs `<name>.1` to `<name>.N`, each with
+  `DEVRUN_REPLICA=<k>` in its environment. `${DEVRUN_REPLICA}` works in `env`,
+  `env_file`, `cwd` and `ready.http`. Logs are `<name>.<k>.log`. `after` on the
+  name waits for every replica, `worker.2` names one, and on the command line
+  `devrun logs worker` and `devrun restart worker` mean all of them.
+- `[profiles.<name>]` with `services` and an optional `env`.
+  `devrun up --profile P` starts those services and what they depend on, with
+  the profile's `env` layered over `[env]`.
+- `devrun up NAME...` starts only those services and what they depend on.
+  `--no-deps` starts only the named ones. Everything left out is `off`, a new
+  state that `devrun wait` counts as settled and `devrun errors` does not count
+  as broken. `devrun start NAME` brings one in later, with its own off
+  dependencies.
+- `autostart = false` keeps a service out of a plain `devrun up`, unless a
+  service that is started depends on it.
+- `restart = "exit-on-end"`: when that service ends on its own, the Session
+  shuts down and devrun exits with its exit status.
+- `restart` as a table: `{ policy = "on-failure", max = 5, backoff = "1s" }`.
+  `backoff` is the wait before the first restart, doubling up to 30 s (default
+  200 ms). `max` gives up after that many restarts in a row and leaves the
+  service `failed`, so `devrun errors` reports it. A run that stayed up 30
+  seconds resets the count.
+- `ready.status = 204` sets the exact HTTP status a check expects. The default
+  is still any 2xx or 3xx.
+- `stop.command` (a string or an array) runs when the service is stopped, with
+  its env and cwd, and also for a service that already exited this Session, so
+  `docker compose up -d` can clean up after itself. If the service is still
+  running afterwards it gets `stop.signal`; `stop.timeout` bounds the whole
+  thing.
+- `watch = ["src"]`, or `{ paths, ignore, debounce }`, restarts a service when a
+  file under its `cwd` changes. Common noise (`.git`, `node_modules`, editor
+  swap files) is ignored by default. Linux inotify; paths that cannot be watched
+  are reported at start.
+- `color = true` by default: services get `FORCE_COLOR=1` and
+  `CLICOLOR_FORCE=1`, unless `NO_COLOR` is set in their environment, `color =
+  false` is set, or `env` already says otherwise. `devrun logs` strips the
+  escapes unless `--raw`, so this costs no tokens.
+- `devrun.local.toml` beside `devrun.toml` is merged over it when present:
+  tables key by key, anything else replaced. For personal overrides that should
+  stay out of git. `devrun config` says when it merged one.
+- `backoff` and `debounce` take milliseconds (`"300ms"`). Probe timings and
+  `stop.timeout` stay whole seconds.
+
 ## 0.1.0
 
 First release. Everything in the original plan is in it.
