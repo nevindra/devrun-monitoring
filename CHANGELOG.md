@@ -8,6 +8,17 @@ and internal tidying stay in the git log, which is where they are useful.
 
 ## Unreleased
 
+### An agent skill
+
+- `devrun skill install` puts a `devrun` skill in `~/.agents/skills` (Codex,
+  OpenCode) and, when `~/.claude` exists, in `~/.claude/skills` (Claude Code).
+  It is loaded only when a task is about local services, unlike the
+  `devrun init` block that is read every turn. `--to DIR` installs to another
+  agent's skills folder; `devrun skill uninstall` removes it and nothing else;
+  `devrun skill` prints the text.
+- The installer runs it for you. `DEVRUN_NO_SKILL=1` or `--no-skill` skips it.
+  `devrun update` refreshes the skill only where it is already installed.
+
 ### Breaking: devrun has its own config
 
 devrun now reads **`devrun.toml`** and no longer reads `process-compose.yaml`

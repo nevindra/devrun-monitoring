@@ -13,6 +13,7 @@ const term = @import("term.zig");
 const sample = @import("sample.zig");
 const update = @import("update.zig");
 const store = @import("store.zig");
+const skill = @import("skill.zig");
 
 /// A byte count as a person would say it. Shared with the TUI rather than
 /// written twice: "48 MB" should read the same whether it came from a footer
@@ -36,6 +37,12 @@ const usage =
     \\  devrun start|stop|restart NAME  Act on one process of a running Session
     \\  devrun clean [--all]            Delete saved logs from previous runs
     \\  devrun init [-o FILE]           Write the agent instructions into AGENTS.md
+    \\  devrun skill [print]            Print the agent skill (SKILL.md)
+    \\  devrun skill install [--to DIR] [--refresh]
+    \\                                  Put it where Codex, OpenCode and Claude Code
+    \\                                  look: ~/.agents/skills, ~/.claude/skills
+    \\  devrun skill uninstall [--to DIR]
+    \\                                  Remove it again
     \\  devrun update                   Replace this binary with the latest release
     \\  devrun version                  Print the version and exit
     \\
@@ -67,6 +74,10 @@ const usage =
     \\  --profile P        Start the services of [profiles.P] and what they need
     \\  --no-deps          Start only the NAMEs given; a dependency that is off
     \\                     counts as satisfied
+    \\
+    \\Options for `skill install` and `skill uninstall`:
+    \\  --to DIR           Use DIR as the skills root instead of the defaults
+    \\  --refresh          Only rewrite a skill that is already installed
     \\
     \\Other options:
     \\  -f FILE            Config to read (default: devrun.toml)
@@ -159,6 +170,7 @@ pub fn main(init: std.process.Init) !u8 {
     if (std.mem.eql(u8, cmd, "down")) return cli.ask(out, "down", null);
     if (std.mem.eql(u8, cmd, "clean")) return cli.clean(out);
     if (std.mem.eql(u8, cmd, "init")) return cli.writeAgentDoc(out);
+    if (std.mem.eql(u8, cmd, "skill")) return cli.skillCommand(out, rest);
     if (std.mem.eql(u8, cmd, "update")) return update.run(gpa, io, init.environ_map, out);
     if (std.mem.eql(u8, cmd, "version") or std.mem.eql(u8, cmd, "--version")) {
         return update.printVersion(out);
@@ -234,6 +246,9 @@ const Cli = struct {
     want_path: bool = false,
     max_line: ?usize = null,
     out_path: ?[]const u8 = null,
+    /// `skill install` and `skill uninstall`.
+    skill_to: ?[]const u8 = null,
+    refresh: bool = false,
 
     /// The flag that made `parseFlags` fail, so the message can name it.
     bad_flag: []const u8 = "",
@@ -280,6 +295,12 @@ const Cli = struct {
                 i += 1;
                 if (i >= args.len) return error.MissingValue;
                 self.out_path = args[i];
+            } else if (std.mem.eql(u8, a, "--to")) {
+                i += 1;
+                if (i >= args.len) return error.MissingValue;
+                self.skill_to = args[i];
+            } else if (std.mem.eql(u8, a, "--refresh")) {
+                self.refresh = true;
             } else if (std.mem.eql(u8, a, "--name")) {
                 i += 1;
                 if (i >= args.len) return error.MissingValue;
@@ -891,6 +912,30 @@ const Cli = struct {
         return 0;
     }
 
+    /// `devrun skill [print|install|uninstall]`. The work is in skill.zig; this
+    /// only routes, so main stays about the command line.
+    fn skillCommand(self: Cli, out: *std.Io.Writer, rest: []const []const u8) !u8 {
+        const sub = if (rest.len > 0) rest[0] else "print";
+        if (std.mem.eql(u8, sub, "print")) {
+            try out.writeAll(skill.text);
+            return 0;
+        }
+        const installing = std.mem.eql(u8, sub, "install");
+        if (!installing and !std.mem.eql(u8, sub, "uninstall")) {
+            try err(self.io, "devrun: skill takes print, install, or uninstall, not \"{s}\"\n", .{sub});
+            return 2;
+        }
+        var buf: [4096]u8 = undefined;
+        var stderr = std.Io.File.stderr().writer(self.io, &buf);
+        defer stderr.interface.flush() catch {};
+        const opts: skill.Options = .{ .to = self.skill_to, .refresh = self.refresh };
+        const home = self.environ.get("HOME");
+        return if (installing)
+            skill.install(self.gpa, self.io, home, opts, out, &stderr.interface)
+        else
+            skill.uninstall(self.gpa, self.io, home, opts, out, &stderr.interface);
+    }
+
     /// Whichever agent file this repo already has. Adding to the one that
     /// exists beats creating a second one that says the same thing.
     fn pickAgentFile(self: Cli) []const u8 {
@@ -1416,4 +1461,5 @@ test {
     _ = sample;
     _ = update;
     _ = store;
+    _ = skill;
 }

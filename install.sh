@@ -13,11 +13,13 @@
 #   DEVRUN_VERSION       install this version instead of the latest
 #   DEVRUN_FROM          the version being replaced; set by `devrun update`
 #   GITHUB_TOKEN         used for the release lookup if the API rate-limits you
+#   DEVRUN_NO_SKILL      set to 1 to leave the agent skill alone (same as --no-skill)
 
 set -eu
 
 REPO="nevindra/devrun-monitoring"
 managed=0
+no_skill=0
 
 say() { printf '%s\n' "$*"; }
 err() { printf 'devrun: %s\n' "$*" >&2; }
@@ -31,16 +33,18 @@ usage() {
 	cat <<'EOF'
 Install devrun.
 
-Usage: install.sh [--dir DIR] [--version VERSION]
+Usage: install.sh [--dir DIR] [--version VERSION] [--no-skill]
 
   --dir DIR          where to put the binary (default: ~/.local/bin)
   --version VERSION  install this version instead of the latest
+  --no-skill         do not install the agent skill (or set DEVRUN_NO_SKILL=1)
 EOF
 }
 
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--managed) managed=1 ;;
+	--no-skill) no_skill=1 ;;
 	--dir)
 		[ $# -ge 2 ] || die "--dir needs a directory"
 		DEVRUN_INSTALL_DIR="$2"
@@ -176,6 +180,21 @@ if [ -n "${DEVRUN_FROM:-}" ]; then
 	say "devrun $DEVRUN_FROM → $version"
 else
 	say "devrun $version installed to $dir/devrun"
+fi
+
+# ---------------------------------------------------------------- skill
+
+# Run by the binary just installed, so the skill text is the one that ships
+# with it and this script needs no second download. A first install puts it
+# everywhere it belongs; an update only refreshes copies that already exist, so
+# someone who removed the skill does not get it back. Never fatal: the binary
+# is installed and verified by now, and a missing skill is not worth a failure.
+if [ "$no_skill" != "1" ] && [ "${DEVRUN_NO_SKILL:-}" != "1" ]; then
+	if [ "$managed" = "1" ]; then
+		"$dir/devrun" skill install --refresh || err "could not refresh the agent skill (devrun skill install retries)"
+	else
+		"$dir/devrun" skill install || err "could not install the agent skill (devrun skill install retries)"
+	fi
 fi
 
 # ---------------------------------------------------------------- path

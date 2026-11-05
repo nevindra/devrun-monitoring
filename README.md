@@ -94,23 +94,41 @@ $ zig build && zig build test
 $ ./zig-out/bin/devrun up
 ```
 
-## Two commands to set it up
+## Set it up for your agent
+
+The installer does this for you. Next to the binary it puts an agent skill in
+`~/.agents/skills/devrun` (read by Codex and OpenCode) and, if you have Claude
+Code, in `~/.claude/skills/devrun`. An agent loads the skill only when the task
+is about running or debugging local services, so it costs nothing the rest of
+the time.
+
+```console
+$ devrun skill install --to ~/.somewhere/skills   # another agent's skills folder
+$ devrun skill uninstall                          # take it out again
+$ devrun skill                                    # print the SKILL.md
+```
+
+`DEVRUN_NO_SKILL=1` (or `--no-skill` on the installer) skips it. `devrun update`
+refreshes the skill only where it is already installed, so removing it sticks.
+
+For a teammate who does not have the skill, or an agent that does not read
+skills, there is the other route:
 
 ```console
 $ cd your-repo
 $ devrun init
 ```
 
-That is it. `devrun init` writes a short section into your repo's `AGENTS.md`,
+`devrun init` writes a short section into your repo's `AGENTS.md`,
 or `CLAUDE.md`, whichever the repo already has, between `<!-- devrun:begin -->`
 markers. Re-running it replaces the block instead of stacking copies, and
 anything you wrote around it survives.
 
-**This is the step that makes the rest reachable.** An agent reads that file
+**Either way, an agent has to be told devrun exists.** An agent reads that file
 before it does anything. A tool that is not named there does not exist to it,
 however good the tool is. The block is four commands and the flags worth
-knowing, kept short on purpose: it lands in a file that is paid for on every
-single turn.
+knowing, kept short on purpose: unlike the skill, it lands in a file that is
+paid for on every single turn.
 
 No `devrun.toml` yet? Write one in a minute from [the config](#the-config), or
 skip it entirely with [one command, no config file](#one-command-no-config-file).
@@ -348,6 +366,8 @@ $ devrun restart api           # act on one Worker without stopping the rest
 $ devrun wait --timeout 90s    # block until ready; non-zero if something failed
 $ devrun down                  # shut the Session down from another terminal
 $ devrun init                  # write the agent instructions into AGENTS.md
+$ devrun skill install         # put the agent skill where Codex/OpenCode/Claude Code look
+$ devrun skill uninstall       # and take it out again
 ```
 
 Run `devrun` with no arguments for every flag.
