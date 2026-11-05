@@ -125,7 +125,9 @@ pub fn run(
         try ui.render();
 
         var extra: [control.Server.max_poll_fds + 1]os.PollFd = undefined;
-        extra[0] = .{ .fd = 0, .events = os.POLL.IN, .revents = 0 };
+        // A negative fd is skipped by poll: once the terminal is gone there is
+        // nothing to read, only Workers still to see out.
+        extra[0] = .{ .fd = if (ui.finished) -1 else 0, .events = os.POLL.IN, .revents = 0 };
         var n: usize = 1;
         if (server) |s| n += s.fillPollFds(extra[1..]);
 
@@ -134,8 +136,15 @@ pub fn run(
         try sup.step(extra[0..n], 100);
         if (server) |s| s.service(extra[1..n], sup);
 
-        if (extra[0].revents & os.POLL.IN != 0) {
+        const tty_re = extra[0].revents;
+        if (tty_re & os.POLL.IN != 0) {
             if (ui.readKeys()) break;
+        }
+        // A hangup with nothing left to read is the terminal going away: the
+        // window was closed, the ssh link dropped, tmux killed the pane. A
+        // dead tty polls ready forever, so without this the loop spins.
+        if (tty_re & os.POLL.IN == 0 and tty_re & (os.POLL.HUP | os.POLL.ERR | os.POLL.NVAL) != 0) {
+            ui.terminalGone();
         }
 
         // The Session is over and the user has not asked to stay. There may
@@ -571,8 +580,18 @@ const Ui = struct {
     /// Returns true when the user is finished with the Session.
     fn readKeys(self: *Ui) bool {
         var buf: [4096]u8 = undefined;
-        const n = os.read(0, &buf) catch return false;
-        if (n == 0) return false;
+        const n = os.read(0, &buf) catch |e| switch (e) {
+            error.WouldBlock => return false,
+            // EIO is what a read on a hung-up terminal returns.
+            else => {
+                self.terminalGone();
+                return false;
+            },
+        };
+        if (n == 0) {
+            self.terminalGone();
+            return false;
+        }
 
         var i: usize = 0;
         while (i < n) {
@@ -700,6 +719,18 @@ const Ui = struct {
         self.sup.beginShutdown();
         self.setStatus("", "Shutting everything down — press q again to leave now", .{});
         return false;
+    }
+
+    /// The terminal is gone, so nobody is left to watch the shutdown or to
+    /// answer the question about logs. Stop the Workers and leave without
+    /// asking: keeping the logs is the answer a missing reader would get by
+    /// pressing Enter. Left running instead, the Session would keep holding
+    /// the control socket, and the next `devrun up` here would be refused as
+    /// "already running" by a process nobody can see.
+    fn terminalGone(self: *Ui) void {
+        self.sup.beginShutdown();
+        self.prompt = .none;
+        self.finished = true;
     }
 
     fn selectBy(self: *Ui, delta: isize) void {
@@ -2435,6 +2466,21 @@ test "the answer that deletes everything leaves nothing behind" {
     try testing.expect(f.ui.answerPrompt(.{ .char = 'y' }));
     try testing.expectEqual(@as(usize, 3), f.ui.cleaned.sessions);
     try testing.expectEqual(@as(usize, 0), store.usage(gpa, f.root).sessions);
+}
+
+test "a terminal that goes away shuts down and leaves without asking about logs" {
+    const gpa = testing.allocator;
+    const f = try Fixture.init(gpa, 5);
+    defer f.deinit();
+    try f.saveRuns(3);
+
+    // Nobody is left to answer, so the question must never block the way
+    // out, and the logs stay: that is what Enter would have chosen.
+    f.ui.terminalGone();
+    try testing.expect(f.sup.shutting_down);
+    try testing.expect(f.ui.beginLeaving());
+    try testing.expectEqual(Prompt.none, f.ui.prompt);
+    try testing.expectEqual(@as(usize, 3), store.usage(gpa, f.root).sessions);
 }
 
 test "q twice leaves without ever asking about logs" {
