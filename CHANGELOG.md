@@ -6,7 +6,7 @@ Newest first. Versions follow [semantic versioning](https://semver.org); until
 Entries say what changed for someone *using* devrun. Refactors, test additions
 and internal tidying stay in the git log, which is where they are useful.
 
-## Unreleased
+## 0.3.0 (2026-11-12)
 
 ### macOS
 

@@ -7,7 +7,7 @@
 Start your whole stack from one `devrun.toml`. Every service's output lands in a plain file,
 and one command answers "what broke?" across all of them.
 
-[![version](https://img.shields.io/badge/version-0.2.0-2b2b2b)](https://github.com/nevindra/devrun-monitoring/releases)
+[![version](https://img.shields.io/badge/version-0.3.0-2b2b2b)](https://github.com/nevindra/devrun-monitoring/releases)
 [![license](https://img.shields.io/badge/license-MIT-2b2b2b)](LICENSE)
 [![platform](https://img.shields.io/badge/linux%20%C2%B7%20macOS-x86__64%20%C2%B7%20aarch64-2b2b2b)](#install)
 [![binary](https://img.shields.io/badge/binary-1.0%20MB-2b2b2b)](#what-you-get)
