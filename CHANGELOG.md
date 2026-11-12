@@ -6,6 +6,21 @@ Newest first. Versions follow [semantic versioning](https://semver.org); until
 Entries say what changed for someone *using* devrun. Refactors, test additions
 and internal tidying stay in the git log, which is where they are useful.
 
+## Unreleased
+
+### macOS
+
+- devrun runs on macOS, Apple silicon and Intel. The installer and
+  `devrun update` pick the right build; releases now carry `*-macos.tar.gz`
+  next to the Linux ones.
+- Everything works as on Linux, with two differences. Memory is physical
+  footprint (what Activity Monitor shows) rather than PSS. And macOS has no
+  subreaper, so a process that leaves its service's process group is neither
+  measured nor stopped; one that stays in it is, even after its parent exits.
+- `watch` uses kqueue there, which needs a file descriptor per watched file.
+  devrun raises its own descriptor limit to fit (16384 watches at most) and
+  starts each service with the limit it would have had anyway.
+
 ## 0.2.0 (2026-11-05)
 
 devrun stands on its own. It reads its own `devrun.toml`, starts the parts of

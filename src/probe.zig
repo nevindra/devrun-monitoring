@@ -61,7 +61,7 @@ pub const Probe = struct {
     /// Built once at startup so an attempt never formats or allocates.
     exec_argv: ?[*:null]const ?[*:0]const u8 = null,
     exec_path: ?[*:0]const u8 = null,
-    http_addr: os.linux.sockaddr.in = undefined,
+    http_addr: os.sockaddr.in = undefined,
     http_request: []const u8 = &.{},
     /// `ready.status`: the one code that passes. Null accepts any 2xx or 3xx.
     http_status: ?u16 = null,
@@ -180,7 +180,7 @@ pub const Probe = struct {
     }
 
     fn beginHttp(self: *Probe) void {
-        const fd = os.socket(os.linux.AF.INET, os.linux.SOCK.STREAM, 0) catch {
+        const fd = os.socket(os.AF.INET, os.SOCK.STREAM, 0) catch {
             self.settle(.fail);
             return;
         };

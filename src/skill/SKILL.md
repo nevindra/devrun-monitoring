@@ -5,7 +5,7 @@ description: Run a project's local dev services with devrun and read all their l
 
 # devrun
 
-devrun starts every service in `devrun.toml`, writes each one's output to a plain file, and answers questions about all of them in one command. Linux only.
+devrun starts every service in `devrun.toml`, writes each one's output to a plain file, and answers questions about all of them in one command. Linux and macOS.
 
 ## Rules
 

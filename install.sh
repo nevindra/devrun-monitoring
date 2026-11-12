@@ -66,13 +66,22 @@ done
 
 # ---------------------------------------------------------------- platform
 
-# Linux only, and said out loud rather than discovered three steps later when a
-# tarball turns out to hold an ELF binary. devrun talks to /proc and to Linux
-# syscalls directly; there is no macOS build to fall back to.
+# Linux and macOS, and anything else said out loud rather than discovered three
+# steps later when a tarball turns out to hold the wrong kind of binary.
 os=$(uname -s)
-[ "$os" = "Linux" ] || die "devrun is Linux only (this is $os). See the README for why."
+case "$os" in
+Linux) platform=linux ;;
+Darwin) platform=macos ;;
+*) die "no prebuilt binary for $os; devrun runs on Linux and macOS. Build from source: https://github.com/$REPO" ;;
+esac
 
 machine=$(uname -m)
+# A shell running under Rosetta reports x86_64 on an Apple silicon Mac. The
+# x86_64 build would work there too, translated; the native one is better.
+if [ "$platform" = "macos" ] && [ "$machine" = "x86_64" ] &&
+	[ "$(sysctl -n sysctl.proc_translated 2>/dev/null)" = "1" ]; then
+	machine=arm64
+fi
 case "$machine" in
 x86_64 | amd64) arch=x86_64 ;;
 aarch64 | arm64) arch=aarch64 ;;
@@ -135,16 +144,20 @@ mkdir -p "$dir" 2>/dev/null || die "cannot create $dir"
 
 # ---------------------------------------------------------------- fetch
 
-tarball="devrun-$version-$arch-linux.tar.gz"
+tarball="devrun-$version-$arch-$platform.tar.gz"
 base="https://github.com/$REPO/releases/download/v$version"
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
-say "devrun $version ($arch) → $dir"
+say "devrun $version ($arch-$platform) → $dir"
 
-fetch_to "$base/$tarball" "$tmp/$tarball" ||
+# Releases before macOS support were built for Linux only, so asking one of
+# them for a macOS tarball is the likely reason this fails on a Mac.
+if ! fetch_to "$base/$tarball" "$tmp/$tarball"; then
+	[ "$platform" = "macos" ] && die "could not download $base/$tarball — devrun $version may predate macOS builds"
 	die "could not download $base/$tarball"
+fi
 fetch_to "$base/SHA256SUMS" "$tmp/SHA256SUMS" ||
 	die "could not download the checksums for $version"
 
@@ -166,8 +179,10 @@ tar -xzf "$tmp/$tarball" -C "$tmp" || die "could not unpack $tarball"
 
 # Staged beside the target and renamed into place, so the swap is one atomic
 # operation on the same filesystem: nobody ever sees a half-written devrun, and
-# a `mv` over a *running* binary is fine on Linux — the old inode stays alive
-# for whoever still has it open.
+# a `mv` over a *running* binary is fine — the old inode stays alive for
+# whoever still has it open. On macOS it is also the only safe way: writing
+# over a signed binary in place leaves the kernel holding a stale signature for
+# that inode, and the next launch is killed on sight.
 staged="$dir/.devrun.$$"
 cp "$tmp/devrun" "$staged" || die "cannot write to $dir"
 chmod 755 "$staged"

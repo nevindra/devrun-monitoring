@@ -4,9 +4,14 @@
 #
 #   git tag v0.1.0 && git push origin v0.1.0
 #
-# Both targets are musl, which for a program that never links libc means the
-# artifact is a genuinely static ELF — it runs on whatever glibc the machine
-# has, including none.
+# The Linux targets are musl, which for a program that never links libc means
+# the artifact is a genuinely static ELF — it runs on whatever glibc the machine
+# has, including none. The macOS targets link libSystem, as every macOS program
+# must; Zig carries its own stubs for it, so they cross-compile from the same
+# Linux runner without an Apple SDK.
+#
+# Nothing is published until both platforms have run the tests and run the
+# binary that is about to ship: Linux here, macOS on a runner of its own.
 name: release
 
 on:
@@ -22,8 +27,10 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  build:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -32,6 +39,7 @@ jobs:
           version: 0.17.0
 
       - name: Resolve version
+        id: version
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             version="${{ inputs.version }}"
@@ -39,6 +47,7 @@ jobs:
             version="${GITHUB_REF_NAME}"
           fi
           echo "VERSION=${version#v}" >> "$GITHUB_ENV"
+          echo "version=${version#v}" >> "$GITHUB_OUTPUT"
 
       # Before anything is built, let alone published. Tests run at Debug, so
       # this is the bounds and overflow checks the release binary drops.
@@ -48,25 +57,29 @@ jobs:
       - name: Build
         run: |
           mkdir -p dist
-          for target in x86_64-linux-musl aarch64-linux-musl; do
+          for target in x86_64-linux-musl aarch64-linux-musl x86_64-macos aarch64-macos; do
             arch="${target%%-*}"
+            case "$target" in
+              *-macos) platform=macos ;;
+              *) platform=linux ;;
+            esac
             zig build \
               -Dtarget="$target" \
               -Doptimize=fast \
               -Dversion="$VERSION" \
-              --prefix "build/$arch"
+              --prefix "build/$arch-$platform"
 
-            stage="stage/$arch"
+            stage="stage/$arch-$platform"
             mkdir -p "$stage"
-            cp "build/$arch/bin/devrun" "$stage/devrun"
+            cp "build/$arch-$platform/bin/devrun" "$stage/devrun"
             cp LICENSE README.md "$stage/"
-            tar -czf "dist/devrun-$VERSION-$arch-linux.tar.gz" -C "$stage" devrun LICENSE README.md
+            tar -czf "dist/devrun-$VERSION-$arch-$platform.tar.gz" -C "$stage" devrun LICENSE README.md
           done
 
-      # The runner is x86_64, so one of the two artifacts can actually be run.
-      # This catches a -Dversion that never reached the binary, which would
-      # otherwise surface as `devrun update` looping forever on a machine that
-      # is already current.
+      # The runner is x86_64 Linux, so one of the artifacts can actually be
+      # run here. This catches a -Dversion that never reached the binary, which
+      # would otherwise surface as `devrun update` looping forever on a machine
+      # that is already current.
       - name: Smoke test
         run: |
           tar -xzf "dist/devrun-$VERSION-x86_64-linux.tar.gz" -C "$RUNNER_TEMP"
@@ -84,6 +97,63 @@ jobs:
       # which is what install.sh looks for and what `sha256sum -c` expects.
       - name: Checksums
         run: cd dist && sha256sum devrun-*.tar.gz > SHA256SUMS && cat SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  # The tests again, natively, because the macOS backends — libproc, kqueue,
+  # libSystem's calls — are not exercised by a test run on Linux at all. Then
+  # the very tarball that will be published, run on the hardware it is for.
+  macos:
+    needs: build
+    runs-on: macos-latest
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Test
+        run: zig build test
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Smoke test
+        run: |
+          case "$(uname -m)" in
+            arm64) arch=aarch64 ;;
+            *) arch=x86_64 ;;
+          esac
+          tar -xzf "dist/devrun-$VERSION-$arch-macos.tar.gz" -C "$RUNNER_TEMP"
+          # Apple silicon refuses to run an unsigned binary at all. Zig's
+          # linker signs ad hoc; this is the check that it still does.
+          codesign --verify "$RUNNER_TEMP/devrun"
+          got=$("$RUNNER_TEMP/devrun" version)
+          test "$got" = "$VERSION" || {
+            echo "binary reports \"$got\", expected \"$VERSION\"" >&2
+            exit 1
+          }
+
+  publish:
+    needs: [build, macos]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
 
       - name: Publish
         env:

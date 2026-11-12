@@ -5,8 +5,9 @@
 //! deliberate: two implementations of "put the right binary in the right
 //! place" drift apart, and the one that drifts is always the one nobody runs
 //! by hand. So this command's whole job is to work out *where* the replacement
-//! should land — the directory this binary is running from, read from
-//! `/proc/self/exe` rather than guessed — and hand that to the script.
+//! should land — the directory this binary is running from, asked of the OS
+//! (`/proc/self/exe`, or `_NSGetExecutablePath` on macOS) rather than guessed —
+//! and hand that to the script.
 //!
 //! It hands over with `execve` rather than forking and waiting. There is
 //! nothing for devrun to do afterwards, and a supervisor that outlives the
@@ -52,8 +53,8 @@ pub fn run(
     const self_path = os.selfExe(&path_buf) orelse {
         try fail(
             io,
-            "devrun: cannot read /proc/self/exe, so there is no way to tell\n" ++
-                "        which binary to replace. Install over it by hand:\n\n" ++ by_hand,
+            "devrun: cannot find the path of the running binary, so there is no\n" ++
+                "        way to tell which one to replace. Install over it by hand:\n\n" ++ by_hand,
             .{},
         );
         return 1;
@@ -98,7 +99,7 @@ pub fn run(
     // buffer with it.
     try out.flush();
 
-    _ = os.linux.execve(sh.ptr, argv.ptr, try envp(arena, environ));
+    os.execve(sh.ptr, argv.ptr, try envp(arena, environ));
 
     // Only reachable when the exec itself failed.
     try fail(io, "devrun: could not run {s}. Install by hand:\n\n" ++ by_hand, .{sh});

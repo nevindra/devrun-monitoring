@@ -9,7 +9,7 @@ and one command answers "what broke?" across all of them.
 
 [![version](https://img.shields.io/badge/version-0.2.0-2b2b2b)](https://github.com/nevindra/devrun-monitoring/releases)
 [![license](https://img.shields.io/badge/license-MIT-2b2b2b)](LICENSE)
-[![platform](https://img.shields.io/badge/linux-x86__64%20%C2%B7%20aarch64-2b2b2b)](#install)
+[![platform](https://img.shields.io/badge/linux%20%C2%B7%20macOS-x86__64%20%C2%B7%20aarch64-2b2b2b)](#install)
 [![binary](https://img.shields.io/badge/binary-1.0%20MB-2b2b2b)](#what-you-get)
 [![rss](https://img.shields.io/badge/idle%20RSS-~4%20MB-2b2b2b)](#what-you-get)
 [![zig](https://img.shields.io/badge/zig-0.17-2b2b2b)](https://ziglang.org/download/#release-0.17.0)
@@ -53,8 +53,8 @@ to ask you. With devrun it asks one question and gets the whole story.
 $ curl -fsSL https://raw.githubusercontent.com/nevindra/devrun-monitoring/main/install.sh | sh
 ```
 
-Static x86_64 and aarch64 binaries, checked against the release's `SHA256SUMS`
-before anything is written. Lands in `~/.local/bin` (`DEVRUN_INSTALL_DIR`
+x86_64 and aarch64 binaries for Linux (static) and macOS, checked against the
+release's `SHA256SUMS` before anything is written. Lands in `~/.local/bin` (`DEVRUN_INSTALL_DIR`
 overrides). `devrun update` fetches the latest release later.
 
 **The agent skill installs with it.** Next to the binary, the installer puts a
@@ -83,6 +83,10 @@ $ zig build && zig build test
 $ ./zig-out/bin/devrun up
 ```
 
+Builds natively on Linux and macOS, and cross-compiles either way without an
+Apple SDK: `zig build -Dtarget=aarch64-macos` (or `x86_64-macos`,
+`x86_64-linux-musl`, `aarch64-linux-musl`).
+
 ## What you get
 
 | | | |
@@ -92,7 +96,7 @@ $ ./zig-out/bin/devrun up
 | **Replicas** <br> `replicas = 3` gives `worker.1` to `worker.3`, each with its own log | **Restart limits** <br> `max` and `backoff` stop a boot crash from looping forever | **One-command e2e** <br> `restart = "exit-on-end"` tears down the stack and exits with the suite's status |
 | **Ready checks** <br> `http`, `exec` or `log`, with `after` waiting on them | **Stop commands** <br> `stop.command` cleans up daemons like `docker compose up -d` | **Local overrides** <br> `devrun.local.toml` for your ports and tokens, kept out of git |
 | **A real TUI** <br> Service table, scrollable logs, line picking, copy over OSC 52 | **`devrun run CMD`** <br> Everything above for a single command, no config file | **Agent skill** <br> Installed with the binary, loaded only when relevant |
-| **One static binary** <br> About 1.0 MB, nothing to fetch at runtime | **Tiny footprint** <br> About 4.4 MB RSS idle with 4 services, 0 CPU ticks over 10 idle seconds | **Typo-proof config** <br> Unknown fields are refused, with the right name suggested |
+| **One binary** <br> About 1.0 MB, nothing to fetch at runtime; fully static on Linux | **Tiny footprint** <br> About 4.4 MB RSS idle with 4 services, 0 CPU ticks over 10 idle seconds | **Typo-proof config** <br> Unknown fields are refused, with the right name suggested |
 
 <sub>Footprint measured on 0.2.0, Linux, ReleaseFast, stripped: supervisor only, not the services it runs.</sub>
 
@@ -353,8 +357,10 @@ into that service's log.
 again if it had exited or failed. Ignored by default (names you add under
 `ignore` add to these): `.git`, `.devrun`, `node_modules`, `__pycache__`,
 `.venv`, `.zig-cache`, `zig-out`, `*.swp`, `*.swx`, `*~`, `4913` and `.#*`. A
-pattern matches a file or directory name. Uses Linux inotify; a path that cannot
-be watched is reported when the Session starts.
+pattern matches a file or directory name. Uses inotify on Linux and kqueue on
+macOS, where every watched file holds a file descriptor (capped at 16384), so
+`ignore` what you do not need watched. A path that cannot be watched is reported
+when the Session starts.
 
 **Colour.** Piped output makes most tools turn colour off, so devrun sets
 `FORCE_COLOR=1` and `CLICOLOR_FORCE=1`. It does not when `NO_COLOR` is set in the
@@ -499,8 +505,8 @@ lines out of it, and see which process is working.
   own selection needs **Shift** held, because the mouse is tracked.
 - **The box title is the log's path**, so "can you send me this?" is answered by
   a filename.
-- **Memory is the whole process tree, as PSS**, not just the process you
-  launched. A service started through `uv`, `npm` or a shell wrapper puts almost
+- **Memory is the whole process tree, as PSS** (on macOS, physical footprint,
+  what Activity Monitor shows), not just the process you launched. A service started through `uv`, `npm` or a shell wrapper puts almost
   nothing in that first process. `PROC` says how many processes the figure
   covers. The CPU figure includes processes already gone, so a service that forks
   per unit of work (`make`, `tsc`) does not report 0% while pinning a core.
@@ -583,9 +589,10 @@ sync to offer the same thing. If that turns out to be wrong it is a small thing 
 add later.
 
 **Does it work on macOS?**
-Not yet. Nothing is built that would have to be torn out to add it: the event loop
-is `poll()` with a self-pipe, and resource accounting sits behind one narrow
-backend interface.
+Yes, on Apple silicon and Intel. Two differences from Linux: memory is physical
+footprint rather than PSS, and macOS has no subreaper, so a process that leaves
+its service's process group (a real daemon that calls `setsid`) is neither
+measured nor stopped. Everything still in the group is, orphans included.
 
 **Does it leave anything behind?**
 One directory, `.devrun/`, beside your config: the log files, the control socket,

@@ -61,6 +61,26 @@
 //! branch instead of letting them reparent to PID 1. A kernel without
 //! `CONFIG_PROC_CHILDREN` cannot be walked that way, so the full scan stays as
 //! the fallback.
+//!
+//! ## macOS
+//!
+//! There is no `/proc`, and no subreaper to keep a Group's orphans on our
+//! branch, so a tick asks the kernel for each Group directly:
+//! `proc_listpids(PROC_PGRP_ONLY, pgid)` names exactly the processes a
+//! `kill(-pgid)` would reach, orphans included, and nothing else. Each is then
+//! read with one `proc_pid_rusage` call, which carries everything a tick needs:
+//!
+//!   * CPU, as `ri_user_time + ri_system_time + ri_child_user_time +
+//!     ri_child_system_time`. The `child` pair is XNU's `cutime`/`cstime` —
+//!     folded in at reap time, recursively — so the rule above holds unchanged
+//!     and the port needed no accumulator for the dead after all.
+//!   * Memory, as `ri_phys_footprint`: what Activity Monitor calls Memory. It
+//!     is not PSS, but it is the right kind of number for a sum — it charges a
+//!     process for the pages it dirtied and compressed, not for every shared
+//!     page it maps — so a Group of forked workers does not count its parent's
+//!     image once per child. It is also cheap, so there is no rotation.
+//!   * Disk I/O, as `ri_diskio_bytesread` / `ri_diskio_byteswritten`, banked by
+//!     the same accumulator as on Linux.
 
 const std = @import("std");
 const os = @import("os.zig");
@@ -71,6 +91,7 @@ const Pid = os.Pid;
 /// `/proc` reports CPU in USER_HZ, which is 100 on Linux regardless of the
 /// kernel's own tick rate. It is part of the ABI, not a build option.
 const user_hz = 100;
+const ns_per_tick = std.time.ns_per_s / user_hz;
 
 /// What a reader sees. Rates are already differentiated; totals are not, so a
 /// caller can render either without keeping state of its own.
@@ -102,8 +123,9 @@ pub const Sample = struct {
 const Totals = struct {
     /// Assigned from the live set each tick rather than accumulated — see the
     /// module header. Falls back to zero while a Group is not running, which
-    /// is why the rate is taken with a saturating subtraction.
-    cpu_ticks: u64 = 0,
+    /// is why the rate is taken with a saturating subtraction. Nanoseconds,
+    /// because that is the unit both platforms can be converted into exactly.
+    cpu_ns: u64 = 0,
     /// Accumulated, because `/proc/<pid>/io` has no `cutime` to carry the
     /// bytes of a pid that has already gone.
     read_bytes: u64 = 0,
@@ -154,7 +176,7 @@ pub const ProcInfo = struct {
 /// halfway through a walk for want of scratch space.
 const Current = struct {
     memory_bytes: u64 = 0,
-    cpu_ticks: u64 = 0,
+    cpu_ns: u64 = 0,
     processes: u32 = 0,
 };
 
@@ -186,6 +208,7 @@ pub const Sampler = struct {
     walk_children: bool,
 
     pub fn init(gpa: Allocator, groups: usize) !Sampler {
+        if (os.is_darwin) darwin.initTimebase();
         const totals = try gpa.alloc(Totals, groups);
         @memset(totals, .{});
         errdefer gpa.free(totals);
@@ -222,7 +245,9 @@ pub const Sampler = struct {
         self.tick += 1;
         @memset(self.current, .{});
 
-        if (self.walk_children) {
+        if (os.is_darwin) {
+            self.scanGroups(pgids);
+        } else if (self.walk_children) {
             self.scanDescendants(pgids);
         } else {
             self.scanProc(pgids);
@@ -241,7 +266,7 @@ pub const Sampler = struct {
             // carries every pid this Group has buried, so adding a delta on
             // top would count a reaped child once as itself and again as its
             // parent's inheritance.
-            self.totals[i].cpu_ticks = self.current[i].cpu_ticks;
+            self.totals[i].cpu_ns = self.current[i].cpu_ns;
             const total = self.totals[i];
             o.* = .{
                 .memory_bytes = self.current[i].memory_bytes,
@@ -253,11 +278,11 @@ pub const Sampler = struct {
                 // tick reading 0% is the honest answer there; a negative rate
                 // is not an answer at all.
                 .cpu_percent = if (first or elapsed_ms == 0) 0 else cpuPercent(
-                    total.cpu_ticks -| self.previous_cpu[i],
+                    total.cpu_ns -| self.previous_cpu[i],
                     elapsed_ms,
                 ),
             };
-            self.previous_cpu[i] = total.cpu_ticks;
+            self.previous_cpu[i] = total.cpu_ns;
         }
     }
 
@@ -276,7 +301,7 @@ pub const Sampler = struct {
     /// exits, and the next tick picks it up again if it is still alive.
     fn scanDescendants(self: *Sampler, pgids: []const Pid) void {
         self.frontier.clearRetainingCapacity();
-        self.frontier.append(self.gpa, os.linux.getpid()) catch return;
+        self.frontier.append(self.gpa, os.getpid()) catch return;
 
         var i: usize = 0;
         while (i < self.frontier.items.len and i < max_visited) : (i += 1) {
@@ -335,9 +360,19 @@ pub const Sampler = struct {
         }
     }
 
+    /// Each running Group, asked of the kernel by its process group id. The
+    /// macOS path; see the module header.
+    fn scanGroups(self: *Sampler, pgids: []const Pid) void {
+        var pids: [1024]Pid = undefined;
+        for (pgids) |pgid| {
+            if (pgid == 0) continue;
+            for (darwin.groupMembers(pgid, &pids)) |pid| self.account(pid, pgids);
+        }
+    }
+
     /// Folds one process into its Group's numbers, if it is in one.
     fn account(self: *Sampler, pid: Pid, pgids: []const Pid) void {
-        const stat: ProcStat = readStat(pid) orelse return;
+        const stat: Reading = readProc(pid) orelse return;
         const group = indexOfPgid(pgids, stat.pgid) orelse return;
 
         const gop = self.live.getOrPut(self.gpa, pid) catch return;
@@ -358,12 +393,12 @@ pub const Sampler = struct {
 
         const c = &self.current[group];
         c.processes += 1;
-        c.cpu_ticks += stat.cpuTicks();
+        c.cpu_ns += stat.cpu_ns;
 
         // Memory is not folded in here: the Group's total is summed in
         // `foldMemory`, after the PSS rotation has had its turn, so that a pid
         // measured this tick contributes its PSS rather than last tick's.
-        st.rss_bytes = stat.rss_pages * std.heap.pageSize();
+        st.rss_bytes = stat.memory_bytes;
         st.comm = stat.comm;
         st.comm_len = stat.comm_len;
 
@@ -374,7 +409,7 @@ pub const Sampler = struct {
         // A pid is only ever compared against itself, so the delta cannot be
         // polluted by a different process reusing the number: a reused pid
         // arrives as `!found_existing` with a zeroed baseline.
-        const io = readIo(pid);
+        const io = stat.io orelse readIo(pid);
         self.totals[group].read_bytes += io.read -| st.io.read;
         self.totals[group].write_bytes += io.write -| st.io.write;
 
@@ -496,7 +531,8 @@ const pss_per_tick = 3;
 /// Whether this kernel exposes the per-thread `children` list. Checked once,
 /// because a kernel does not grow the file halfway through a Session.
 fn childrenSupported() bool {
-    const pid = os.linux.getpid();
+    if (os.is_darwin) return false;
+    const pid = os.getpid();
     var path: [80]u8 = undefined;
     const p = std.fmt.bufPrintSentinel(&path, "/proc/{d}/task/{d}/children", .{ pid, pid }, 0) catch
         return false;
@@ -505,9 +541,9 @@ fn childrenSupported() bool {
     return true;
 }
 
-fn cpuPercent(ticks: u64, elapsed_ms: u64) f32 {
-    const cpu_ms = ticks * (1000 / user_hz);
-    return @as(f32, @floatFromInt(cpu_ms)) * 100.0 / @as(f32, @floatFromInt(elapsed_ms));
+fn cpuPercent(cpu_ns: u64, elapsed_ms: u64) f32 {
+    const elapsed_ns = elapsed_ms * std.time.ns_per_ms;
+    return @as(f32, @floatFromInt(cpu_ns)) * 100.0 / @as(f32, @floatFromInt(elapsed_ns));
 }
 
 fn indexOfPgid(pgids: []const Pid, pgid: Pid) ?usize {
@@ -538,6 +574,119 @@ const ProcStat = struct {
     /// live set rather than accumulated per pid.
     fn cpuTicks(self: ProcStat) u64 {
         return self.utime + self.stime + self.cutime + self.cstime;
+    }
+};
+
+/// One process at one instant, in the units a Sample is built from, whichever
+/// platform it was read on.
+const Reading = struct {
+    pgid: Pid,
+    /// Its own CPU and everything it has reaped. See the module header.
+    cpu_ns: u64,
+    /// RSS on Linux, which the PSS rotation refines; physical footprint on
+    /// macOS, which needs no refining.
+    memory_bytes: u64,
+    /// Read alongside on macOS, where one call answers everything; null on
+    /// Linux, where it is a second file read only once the pid is known to be
+    /// in a Group.
+    io: ?Io = null,
+    comm: [comm_max]u8 = @splat(0),
+    comm_len: u8 = 0,
+};
+
+fn readProc(pid: Pid) ?Reading {
+    if (os.is_darwin) return darwin.read(pid);
+    const stat = readStat(pid) orelse return null;
+    return .{
+        .pgid = stat.pgid,
+        .cpu_ns = stat.cpuTicks() * ns_per_tick,
+        .memory_bytes = stat.rss_pages * std.heap.pageSize(),
+        .comm = stat.comm,
+        .comm_len = stat.comm_len,
+    };
+}
+
+/// libproc, which is part of libSystem and so needs nothing linked beyond it.
+const darwin = struct {
+    extern "c" fn proc_listpids(kind: u32, typeinfo: u32, buffer: ?*anyopaque, size: c_int) c_int;
+    extern "c" fn proc_pid_rusage(pid: c_int, flavor: c_int, buffer: *anyopaque) c_int;
+    extern "c" fn proc_name(pid: c_int, buffer: [*]u8, size: u32) c_int;
+
+    const PROC_PGRP_ONLY = 2;
+    const RUSAGE_INFO_V2 = 2;
+
+    /// `struct rusage_info_v2` from `<sys/resource.h>`.
+    const RusageInfoV2 = extern struct {
+        uuid: [16]u8,
+        user_time: u64,
+        system_time: u64,
+        pkg_idle_wkups: u64,
+        interrupt_wkups: u64,
+        pageins: u64,
+        wired_size: u64,
+        resident_size: u64,
+        phys_footprint: u64,
+        proc_start_abstime: u64,
+        proc_exit_abstime: u64,
+        child_user_time: u64,
+        child_system_time: u64,
+        child_pkg_idle_wkups: u64,
+        child_interrupt_wkups: u64,
+        child_pageins: u64,
+        child_elapsed_abstime: u64,
+        diskio_bytesread: u64,
+        diskio_byteswritten: u64,
+    };
+
+    /// The `*_time` fields are in Mach absolute-time units, not nanoseconds as
+    /// the header claims. On Intel the two coincide; on Apple silicon a unit
+    /// is 125/3 ns, and reading them as nanoseconds understates CPU by a
+    /// factor of forty.
+    var timebase: std.c.mach_timebase_info_data = .{ .numer = 1, .denom = 1 };
+
+    fn initTimebase() void {
+        var tb: std.c.mach_timebase_info_data = undefined;
+        if (std.c.mach_timebase_info(&tb) == 0 and tb.denom != 0) timebase = tb;
+    }
+
+    fn toNs(units: u64) u64 {
+        return @intCast(@as(u128, units) * timebase.numer / timebase.denom);
+    }
+
+    /// The pids in a process group. A Group larger than `out` is cut short,
+    /// the way `max_visited` cuts the Linux walk short.
+    fn groupMembers(pgid: Pid, out: []Pid) []const Pid {
+        const size: c_int = @intCast(@min(out.len * @sizeOf(Pid), std.math.maxInt(c_int)));
+        const rc = proc_listpids(PROC_PGRP_ONLY, @intCast(pgid), out.ptr, size);
+        if (rc <= 0) return out[0..0];
+        const n: usize = @as(usize, @intCast(rc)) / @sizeOf(Pid);
+        // The list is not compacted for pids that went away mid-call.
+        var kept: usize = 0;
+        for (out[0..@min(n, out.len)]) |pid| {
+            if (pid <= 0) continue;
+            out[kept] = pid;
+            kept += 1;
+        }
+        return out[0..kept];
+    }
+
+    fn read(pid: Pid) ?Reading {
+        var ri: RusageInfoV2 = undefined;
+        if (proc_pid_rusage(pid, RUSAGE_INFO_V2, &ri) != 0) return null;
+        const pgid = os.getpgid(pid) orelse return null;
+        var out: Reading = .{
+            .pgid = pgid,
+            .cpu_ns = toNs(ri.user_time + ri.system_time + ri.child_user_time + ri.child_system_time),
+            .memory_bytes = ri.phys_footprint,
+            .io = .{ .read = ri.diskio_bytesread, .write = ri.diskio_byteswritten },
+        };
+        var name: [64]u8 = undefined;
+        const n = proc_name(pid, &name, name.len);
+        if (n > 0) {
+            out.comm_len = @intCast(@min(@as(usize, @intCast(n)), comm_max));
+            @memcpy(out.comm[0..out.comm_len], name[0..out.comm_len]);
+        }
+        return out;
     }
 };
 
@@ -617,6 +766,8 @@ fn parseStat(text: []const u8) ?ProcStat {
 /// a lie a reader can act wrongly on, whereas CPU — which does move fast —
 /// stays on `stat` and is still read for every pid every tick.
 fn readPss(pid: Pid) ?u64 {
+    // macOS's figure is a footprint already, read every tick; see the header.
+    if (os.is_darwin) return null;
     var path: [64]u8 = undefined;
     const p = std.fmt.bufPrintSentinel(&path, "/proc/{d}/smaps_rollup", .{pid}, 0) catch return null;
     // The file is around 700 bytes and `Pss:` is its third line.
@@ -685,8 +836,9 @@ fn readSmallFile(path: [*:0]const u8, buf: []u8) ?[]const u8 {
 const testing = std.testing;
 
 test "readStat survives a command name containing spaces and parentheses" {
+    if (os.is_darwin) return error.SkipZigTest; // no /proc
     // Our own pid is the one process guaranteed to exist while this runs.
-    const me = os.linux.getpid();
+    const me = os.getpid();
     const stat = readStat(me) orelse return error.NoStat;
     // A test binary is its own process group leader or a child of the runner;
     // either way procfs must give a plausible pgid and some resident memory.
@@ -756,15 +908,18 @@ test "parseStat refuses a line it cannot trust rather than guessing" {
     try testing.expect(parseStat("1 (x) S 1 nonsense 1 1") == null);
 }
 
-test "cpuPercent turns ticks into percent of one core" {
-    // 100 ticks is one full second of CPU; over one second that is one core.
-    try testing.expectApproxEqAbs(@as(f32, 100.0), cpuPercent(100, 1000), 0.01);
+test "cpuPercent turns CPU time into percent of one core" {
+    const s = std.time.ns_per_s;
+    // One full second of CPU over one second is one core.
+    try testing.expectApproxEqAbs(@as(f32, 100.0), cpuPercent(s, 1000), 0.01);
     // Two cores' worth in the same wall-clock second.
-    try testing.expectApproxEqAbs(@as(f32, 200.0), cpuPercent(200, 1000), 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 200.0), cpuPercent(2 * s, 1000), 0.01);
     // Idle.
     try testing.expectApproxEqAbs(@as(f32, 0.0), cpuPercent(0, 1000), 0.01);
     // Half a core over two seconds.
-    try testing.expectApproxEqAbs(@as(f32, 50.0), cpuPercent(100, 2000), 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 50.0), cpuPercent(s, 2000), 0.01);
+    // A Linux tick is 10 ms of it.
+    try testing.expectApproxEqAbs(@as(f32, 100.0), cpuPercent(100 * ns_per_tick, 1000), 0.01);
 }
 
 test "parseTrailingInt reads a procfs key: value line" {
@@ -818,7 +973,7 @@ fn readRollupRss(pid: Pid) ?u64 {
 }
 
 test "PSS is real, and never larger than the RSS it refines" {
-    const me = os.linux.getpid();
+    const me = os.getpid();
     const pss = readPss(me) orelse {
         // A kernel without smaps_rollup is a supported configuration: the
         // rotation simply never records a reading and every pid keeps its RSS.
@@ -846,14 +1001,14 @@ test "a Group's memory is never zero while it has processes" {
     // first ticks unmeasured. Reporting zero for those would show a freshly
     // started Worker as holding no memory, which is the one answer that would
     // be read as a fact rather than as a figure still settling.
-    const me = os.linux.getpid();
-    const pgid = os.linux.getpgid(0);
+    const me = os.getpid();
+    const pgid = os.getpgid(0) orelse return error.NoPgid;
 
     var s = try Sampler.init(testing.allocator, 1);
     defer s.deinit();
 
     var out: [1]Sample = undefined;
-    const pgids = [_]Pid{@intCast(pgid)};
+    const pgids = [_]Pid{pgid};
 
     s.sample(&pgids, &out);
     try testing.expect(out[0].processes >= 1);
@@ -882,7 +1037,7 @@ test "the breakdown names the biggest processes first" {
     var s = try Sampler.init(testing.allocator, 1);
     defer s.deinit();
 
-    const pgid: Pid = @intCast(os.linux.getpgid(0));
+    const pgid = os.getpgid(0) orelse return error.NoPgid;
     var out: [1]Sample = undefined;
     s.sample(&[_]Pid{pgid}, &out);
 
@@ -944,18 +1099,18 @@ test "CPU is summed from the live set, not accumulated across ticks" {
     var s = try Sampler.init(testing.allocator, 1);
     defer s.deinit();
 
-    const me = os.linux.getpid();
-    const stat = readStat(me) orelse return error.NoStat;
+    const me = os.getpid();
+    const stat = readProc(me) orelse return error.NoStat;
     const pgids = [_]Pid{stat.pgid};
     var out: [1]Sample = undefined;
 
-    // Spend CPU until procfs credits this process a few ticks, so what
+    // Spend CPU until the kernel credits this process a few ticks, so what
     // follows is a statement about a real figure rather than about zero. A
-    // tick is 10 ms, and a whole test binary can run in less than one.
+    // Linux tick is 10 ms, and a whole test binary can run in less than one.
     var sink: u64 = 0;
     var rounds: usize = 0;
     while (rounds < 500) : (rounds += 1) {
-        if ((readStat(me) orelse return error.NoStat).cpuTicks() >= 3) break;
+        if ((readProc(me) orelse return error.NoStat).cpu_ns >= 3 * ns_per_tick) break;
         var i: usize = 1;
         while (i < 2_000_000) : (i += 1) sink +%= i *% 2654435761;
     }
@@ -964,14 +1119,14 @@ test "CPU is summed from the live set, not accumulated across ticks" {
     try testing.expect(rounds == 0 or sink != 0);
 
     s.sample(&pgids, &out);
-    try testing.expect(s.totals[0].cpu_ticks > 0);
+    try testing.expect(s.totals[0].cpu_ns > 0);
     // The sharp one: the Group's figure is exactly what this walk found. A
     // `+=` here would pass on the first tick and diverge on every one after.
-    try testing.expectEqual(s.current[0].cpu_ticks, s.totals[0].cpu_ticks);
+    try testing.expectEqual(s.current[0].cpu_ns, s.totals[0].cpu_ns);
 
     s.sample(&pgids, &out);
-    try testing.expect(s.totals[0].cpu_ticks > 0);
-    try testing.expectEqual(s.current[0].cpu_ticks, s.totals[0].cpu_ticks);
+    try testing.expect(s.totals[0].cpu_ns > 0);
+    try testing.expectEqual(s.current[0].cpu_ns, s.totals[0].cpu_ns);
 }
 
 test "a pid offered twice in one walk is only charged once" {
@@ -980,18 +1135,18 @@ test "a pid offered twice in one walk is only charged once" {
     var s = try Sampler.init(testing.allocator, 1);
     defer s.deinit();
 
-    const me = os.linux.getpid();
-    const stat = readStat(me) orelse return error.NoStat;
+    const me = os.getpid();
+    const stat = readProc(me) orelse return error.NoStat;
     const pgids = [_]Pid{stat.pgid};
 
     s.tick = 1;
     s.account(me, &pgids);
     const once = s.current[0];
-    try testing.expect(once.cpu_ticks > 0);
+    try testing.expect(once.cpu_ns > 0);
     try testing.expectEqual(@as(u32, 1), once.processes);
 
     s.account(me, &pgids);
-    try testing.expectEqual(once.cpu_ticks, s.current[0].cpu_ticks);
+    try testing.expectEqual(once.cpu_ns, s.current[0].cpu_ns);
     try testing.expectEqual(@as(u32, 1), s.current[0].processes);
     try testing.expectEqual(once.memory_bytes, s.current[0].memory_bytes);
 }
@@ -1010,7 +1165,7 @@ test "sampling a live Group sees this process" {
     defer s.deinit();
 
     // The test process's own group is guaranteed to have at least one member.
-    const stat = readStat(os.linux.getpid()) orelse return error.NoStat;
+    const stat = readProc(os.getpid()) orelse return error.NoStat;
     const pgids = [_]Pid{stat.pgid};
     var out: [1]Sample = undefined;
 

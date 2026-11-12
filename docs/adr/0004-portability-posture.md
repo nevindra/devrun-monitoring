@@ -35,3 +35,15 @@ The cost is why the implementation had drifted to RSS in the first place. `/proc
 So PSS is read for a few pids per tick, stalest first, while CPU stays on `stat` for every pid every tick. The asymmetry is not a compromise but a match to the signals: memory moves slowly enough that a few seconds of lag cannot mislead, and CPU does not. A pid whose turn has not come reports its RSS, so a Group's figure begins where it always did and settles downward onto the truth — it never begins at zero, which is the one answer a reader would take as fact rather than as a figure still arriving.
 
 This restores what the consequences above already assumed: `smaps_rollup` in the read set, and PSS as the thing a macOS port would be giving up.
+
+## Amendment: macOS is in scope, and the port was the size predicted
+
+The posture paid off as stated. The event loop, the self-pipe, the Group, the accumulator and the rotation are unchanged; what changed sits behind the seams this ADR drew. Four things are worth knowing that the paragraphs above did not say.
+
+**The syscall layer goes through libc on macOS, and only there.** macOS has no stable syscall ABI, so `os.zig` reaches libSystem through `std.c` behind a shim that returns results in the Linux kernel's convention — a value, or a negated errno — and everything above it is written once. Linux keeps calling the kernel directly and stays a static ELF. Signals are the enum, never a number: SIGUSR1 is 10 on one platform and 30 on the other.
+
+**The CPU question left unresolved above has an answer, and it is the same rule.** `proc_pid_rusage` with `RUSAGE_INFO_V2` returns `ri_child_user_time` and `ri_child_system_time`, which XNU folds in at reap time, recursively — `cutime` and `cstime` by another name. So `Σ live (own + reaped children)` holds unchanged and nothing had to be captured at `wait4`. One trap: the `*_time` fields are Mach absolute-time units, not the nanoseconds the header claims, and on Apple silicon a unit is 125/3 ns.
+
+**Groups are enumerated, not walked.** With no subreaper there is no subtree to walk, so a tick asks `proc_listpids(PROC_PGRP_ONLY, pgid)` for each Group. That names exactly what `kill(-pgid)` would reach — which also means an orphan that stays in its group is still measured and still killed, so losing the subreaper costs less than the consequences above expected. Memory is `ri_phys_footprint`: not PSS, but cheap and additive in the way that matters, so there is no rotation.
+
+**The file watcher was the part this ADR did not anticipate.** kqueue is not inotify: a directory's vnode says *that* it changed, not *what*, and a file edited in place changes nothing in its directory. So each directory keeps a name-and-inode snapshot that is diffed on change, and each watched file holds an `O_EVTONLY` descriptor of its own, under the same 16384 cap, with the soft descriptor limit raised to fit and restored for each Worker. FSEvents would have avoided the descriptors, but it needs CoreServices, and with it an Apple SDK at link time — the cross-compile from Linux that the release depends on would have been lost.

@@ -28,6 +28,7 @@
 
 const std = @import("std");
 const toml = @import("toml.zig");
+const os = @import("os.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -394,8 +395,8 @@ fn isBareSafe(arg: []const u8) bool {
 
 /// The name a signal number is written as in a config, for showing it back.
 pub fn signalName(n: u8) ?[]const u8 {
-    const sig: std.os.linux.SIG = @fromBackingInt(@intCast(n));
-    return std.enums.tagName(std.os.linux.SIG, sig);
+    const sig: os.SIG = @fromBackingInt(@intCast(n));
+    return std.enums.tagName(os.SIG, sig);
 }
 
 /// Reads and validates `path`, with the `devrun.local.toml` beside it merged
@@ -943,7 +944,7 @@ fn signal(ctx: Ctx, v: toml.Value, path: []const u8) !u8 {
             if (s.len > buf.len) return ctx.fail("{s}: \"{s}\" is not a signal", .{ path, s });
             const upper = std.ascii.upperString(&buf, s);
             const name = if (std.mem.startsWith(u8, upper, "SIG")) upper[3..] else upper;
-            const sig = std.meta.stringToEnum(std.os.linux.SIG, name) orelse
+            const sig = std.meta.stringToEnum(os.SIG, name) orelse
                 return ctx.fail("{s}: \"{s}\" is not a signal. Try \"INT\", \"TERM\" or \"QUIT\"", .{ path, s });
             return @intCast(@backingInt(sig));
         },

@@ -13,13 +13,41 @@
 
 const std = @import("std");
 const os = @import("os.zig");
-const linux = os.linux;
 
-// x86_64 ioctl numbers. Named here because `std.os.linux` does not export
-// them, and they are ABI rather than configuration.
-const TCGETS = 0x5401;
-const TCSETS = 0x5402;
-const TIOCGWINSZ = 0x5413;
+/// The terminal calls, which are ioctls on Linux and libc on macOS.
+///
+/// On Linux they are made as ioctls directly because devrun links no libc
+/// there; the numbers are named here because `std.os.linux` does not export
+/// them, and they are ABI rather than configuration. macOS has `tcgetattr` and
+/// `tcsetattr` in the libSystem it links anyway, which is the supported way to
+/// say the same thing.
+const tty = if (os.is_darwin) struct {
+    const c = std.c;
+    fn get(fd: os.Fd, t: *os.termios) bool {
+        return c.tcgetattr(fd, t) == 0;
+    }
+    fn set(fd: os.Fd, t: *const os.termios) void {
+        _ = c.tcsetattr(fd, .NOW, t);
+    }
+    fn winsize(fd: os.Fd, ws: *Winsize) bool {
+        return c.ioctl(fd, c.T.IOCGWINSZ, @intFromPtr(ws)) == 0;
+    }
+} else struct {
+    const linux = std.os.linux;
+    // x86_64 ioctl numbers.
+    const TCGETS = 0x5401;
+    const TCSETS = 0x5402;
+    const TIOCGWINSZ = 0x5413;
+    fn get(fd: os.Fd, t: *os.termios) bool {
+        return linux.errno(linux.ioctl(fd, TCGETS, @intFromPtr(t))) == .SUCCESS;
+    }
+    fn set(fd: os.Fd, t: *const os.termios) void {
+        _ = linux.ioctl(fd, TCSETS, @intFromPtr(t));
+    }
+    fn winsize(fd: os.Fd, ws: *Winsize) bool {
+        return linux.errno(linux.ioctl(fd, TIOCGWINSZ, @intFromPtr(ws))) == .SUCCESS;
+    }
+};
 
 const Winsize = extern struct {
     row: u16,
@@ -64,14 +92,12 @@ pub const esc = struct {
 
 pub const Terminal = struct {
     fd: os.Fd,
-    original: linux.termios,
+    original: os.termios,
     raw: bool = false,
 
     pub fn init(fd: os.Fd) !Terminal {
         var t: Terminal = .{ .fd = fd, .original = undefined };
-        if (linux.errno(linux.ioctl(fd, TCGETS, @intFromPtr(&t.original))) != .SUCCESS) {
-            return error.NotATerminal;
-        }
+        if (!tty.get(fd, &t.original)) return error.NotATerminal;
         return t;
     }
 
@@ -90,23 +116,21 @@ pub const Terminal = struct {
         t.iflag.INPCK = false;
         t.iflag.ISTRIP = false;
         // A read may return with nothing; the poll loop decides when to read.
-        t.cc[@backingInt(linux.V.MIN)] = 0;
-        t.cc[@backingInt(linux.V.TIME)] = 0;
-        _ = linux.ioctl(self.fd, TCSETS, @intFromPtr(&t));
+        t.cc[@backingInt(os.V.MIN)] = 0;
+        t.cc[@backingInt(os.V.TIME)] = 0;
+        tty.set(self.fd, &t);
         self.raw = true;
     }
 
     pub fn restore(self: *Terminal) void {
         if (!self.raw) return;
-        _ = linux.ioctl(self.fd, TCSETS, @intFromPtr(&self.original));
+        tty.set(self.fd, &self.original);
         self.raw = false;
     }
 
     pub fn size(self: Terminal) Size {
         var ws: Winsize = undefined;
-        if (linux.errno(linux.ioctl(self.fd, TIOCGWINSZ, @intFromPtr(&ws))) != .SUCCESS) {
-            return .{};
-        }
+        if (!tty.winsize(self.fd, &ws)) return .{};
         if (ws.row == 0 or ws.col == 0) return .{};
         return .{ .rows = ws.row, .cols = ws.col };
     }

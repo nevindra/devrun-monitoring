@@ -21,21 +21,63 @@
 //! Known limit: paths that do not exist at `init` are reported in `problems`
 //! and never picked up later. Watching a not-yet-created directory would mean
 //! watching its ancestors, and the cost of that is out of proportion here.
+//!
+//! ## macOS
+//!
+//! There is no inotify; the descriptor is a kqueue instead, and the rest of
+//! the Watcher — debounce, interests, ignore patterns — does not know. Two
+//! things about kqueue shape the backend:
+//!
+//!   * A directory's vnode reports *that* its entries changed, never *which*.
+//!     So each watched directory keeps a snapshot of its names and inode
+//!     numbers, and a change is turned back into inotify-shaped events by
+//!     re-reading the directory and diffing. The inode is what catches an
+//!     editor's rename-over-save, which leaves the set of names unchanged.
+//!   * A file written in place changes nothing in its directory. So every file
+//!     a target cares about gets a watch of its own — a descriptor, opened
+//!     `O_EVTONLY`, where inotify needed none. That is what `max_watches`
+//!     bounds there, and why the descriptor limit is raised at `init`.
+//!
+//! FSEvents would be recursive and descriptor-free, but it runs on a dispatch
+//! queue and needs CoreServices, which no cross-compiler can link without an
+//! Apple SDK. kqueue is in libSystem and joins `poll` like any descriptor.
 
 const std = @import("std");
 const os = @import("os.zig");
 const Allocator = std.mem.Allocator;
-const linux = os.linux;
-const IN = linux.IN;
+const IN = std.os.linux.IN;
+const NOTE = os.kq.NOTE;
 
 /// Upper bound on live watches across all targets. The kernel has its own
 /// limit (often 8192 per user, shared with every editor and bundler), but
-/// ours bounds devrun's memory regardless of how it is configured.
+/// ours bounds devrun's memory regardless of how it is configured. On macOS
+/// a watch is a descriptor, so this is also the most devrun will open.
 pub const max_watches = 16384;
 
 /// What counts as a change. CLOSE_WRITE rather than MODIFY: a save is one
 /// CLOSE_WRITE, while MODIFY fires on every write(2) of a large file.
 const event_mask: u32 = IN.CLOSE_WRITE | IN.CREATE | IN.DELETE | IN.MOVED_FROM | IN.MOVED_TO;
+
+/// What happened, in the Watcher's own terms. Both backends translate into
+/// these, so `handle` is written once.
+const Ev = struct {
+    /// Something about the named entry changed.
+    const change: u32 = 1 << 0;
+    /// The named entry is a directory.
+    const dir: u32 = 1 << 1;
+    /// The named entry appeared (created, or moved in).
+    const created: u32 = 1 << 2;
+    /// The watched directory itself is gone, and so is its watch.
+    const gone: u32 = 1 << 3;
+    /// Events were lost; nothing can be said about what changed.
+    const overflow: u32 = 1 << 4;
+};
+
+/// What a directory's own kqueue watch listens for.
+const dir_notes: u32 = if (os.is_darwin) NOTE.WRITE | NOTE.DELETE | NOTE.RENAME | NOTE.REVOKE else 0;
+/// What a file's listens for. Content (WRITE, EXTEND) is the change; the rest
+/// only mean the descriptor is now on a file that is no longer there.
+const file_notes: u32 = if (os.is_darwin) NOTE.WRITE | NOTE.EXTEND | NOTE.DELETE | NOTE.RENAME | NOTE.REVOKE else 0;
 
 pub const Target = struct {
     /// Index of the Worker this target restarts.
@@ -70,6 +112,33 @@ const Interest = struct {
 const Dir = struct {
     path: []u8,
     interests: std.ArrayList(Interest) = .empty,
+
+    // macOS only, below. See the module header.
+
+    /// The `O_EVTONLY` descriptor the kqueue watch hangs off.
+    fd: os.Fd = -1,
+    ident: os.kq.Identity = .{ .dev = 0, .ino = 0 },
+    /// What the directory held when last read, by name. Keys are owned.
+    entries: std.StringHashMapUnmanaged(Entry) = .empty,
+};
+
+/// One name in a macOS directory snapshot.
+const Entry = struct {
+    ino: u64,
+    is_dir: bool,
+    /// Set by each re-read, so a name the read did not visit can be told gone.
+    seen: bool = true,
+    /// The file's own watch, when a target cares about it.
+    file: ?i32 = null,
+};
+
+/// A macOS watch on one file. Changes are reported against its directory,
+/// by name, exactly as inotify would report them.
+const FileWatch = struct {
+    fd: os.Fd,
+    dir: i32,
+    /// Owned.
+    name: []u8,
 };
 
 /// The parts of a Target that outlive `init`, copied into the arena so the
@@ -90,6 +159,13 @@ pub const Watcher = struct {
     /// Debounce deadline per Worker (monotonic ms), null when quiet.
     due: []?u64 = &.{},
     by_wd: std.AutoHashMapUnmanaged(i32, *Dir) = .empty,
+    /// macOS: file watches, sharing `by_wd`'s id space — a kevent carries one
+    /// number, and it has to say which of the two maps to look in.
+    files: std.AutoHashMapUnmanaged(i32, FileWatch) = .empty,
+    /// macOS: directories by inode, so two paths to one directory share a
+    /// watch the way inotify returns one `wd` for one inode.
+    by_ident: std.AutoHashMapUnmanaged(os.kq.Identity, i32) = .empty,
+    next_id: i32 = 1,
     /// Set once the kernel or our own cap refuses more watches, so the
     /// warning is recorded exactly once and the walk stops trying.
     full: bool = false,
@@ -116,7 +192,15 @@ pub const Watcher = struct {
         self.due = try gpa.alloc(?u64, worker_count);
         @memset(self.due, null);
 
-        self.fd = try os.inotifyInit();
+        if (os.is_darwin) {
+            self.fd = try os.kq.init();
+            // A descriptor per watch, against a default soft limit of 256. The
+            // headroom is for everything else a Session opens — pipes,
+            // Archives, sockets — which must not be the ones to fail.
+            _ = os.raiseFdLimit(max_watches + 1024);
+        } else {
+            self.fd = try os.inotifyInit();
+        }
         for (targets, 0..) |t, i| {
             for (t.paths) |p| try self.addPath(@intCast(i), t.base, p);
         }
@@ -134,6 +218,8 @@ pub const Watcher = struct {
         var it = self.by_wd.valueIterator();
         while (it.next()) |d| self.freeDir(d.*);
         self.by_wd.deinit(self.gpa);
+        self.files.deinit(self.gpa);
+        self.by_ident.deinit(self.gpa);
         for (self.problems.items) |p| self.gpa.free(p);
         self.problems.deinit(self.gpa);
         self.gpa.free(self.due);
@@ -152,6 +238,8 @@ pub const Watcher = struct {
     /// of the loop; poll is level-triggered and calls us again).
     pub fn onReadable(self: *Watcher, now_ms: u64) void {
         if (self.fd < 0) return;
+        if (os.is_darwin) return self.onKevents(now_ms);
+        const linux = std.os.linux;
         // inotify_event is 4-byte aligned and the kernel packs records
         // back to back, so the buffer must honour that alignment.
         var buf: [4096]u8 align(@alignOf(linux.inotify_event)) = undefined;
@@ -169,7 +257,7 @@ pub const Watcher = struct {
                     null
                 else
                     std.mem.sliceTo(buf[off + header .. end], 0);
-                self.handle(ev.wd, ev.mask, name, now_ms);
+                self.handle(ev.wd, fromInotify(ev.mask), name, now_ms);
                 off = end;
             }
         }
@@ -199,15 +287,25 @@ pub const Watcher = struct {
 
     // ------------------------------------------------------------ events
 
-    fn handle(self: *Watcher, wd: i32, mask: u32, name: ?[]const u8, now_ms: u64) void {
-        if (mask & IN.Q_OVERFLOW != 0) {
+    fn fromInotify(mask: u32) u32 {
+        var ev: u32 = 0;
+        if (mask & IN.Q_OVERFLOW != 0) ev |= Ev.overflow;
+        if (mask & IN.IGNORED != 0) ev |= Ev.gone;
+        if (mask & IN.ISDIR != 0) ev |= Ev.dir;
+        if (mask & (IN.CREATE | IN.MOVED_TO) != 0) ev |= Ev.created;
+        if (mask & event_mask != 0) ev |= Ev.change;
+        return ev;
+    }
+
+    fn handle(self: *Watcher, wd: i32, ev: u32, name: ?[]const u8, now_ms: u64) void {
+        if (ev & Ev.overflow != 0) {
             // The kernel dropped events, so we cannot know what changed.
             // Restarting everything is wrong less often than missing a save.
             for (self.infos, 0..) |_, i| self.touch(@intCast(i), now_ms);
             return;
         }
         const d = self.by_wd.get(wd) orelse return;
-        if (mask & IN.IGNORED != 0) {
+        if (ev & Ev.gone != 0) {
             // The directory was deleted (or unmounted): the kernel has
             // already dropped the watch, so only our bookkeeping remains.
             _ = self.by_wd.remove(wd);
@@ -215,12 +313,13 @@ pub const Watcher = struct {
             return;
         }
         const nm = name orelse return;
+        if (ev & Ev.change == 0) return;
         for (d.interests.items) |in| {
             if (self.ignored(in.target, nm)) continue;
             if (in.file) |f| if (!std.mem.eql(u8, f, nm)) continue;
             self.touch(in.target, now_ms);
         }
-        if (mask & IN.ISDIR != 0 and mask & (IN.CREATE | IN.MOVED_TO) != 0) {
+        if (ev & Ev.dir != 0 and ev & Ev.created != 0) {
             self.watchNewDir(d, nm) catch {
                 // Out of memory: we cannot extend the watch, so make sure
                 // the change itself is not lost.
@@ -284,9 +383,13 @@ pub const Watcher = struct {
 
     /// Adds a watch on `path` and merges `interests` into it. When any
     /// interest is recursive, the existing subdirectories are walked too.
+    fn watchCount(self: *const Watcher) usize {
+        return self.by_wd.count() + self.files.count();
+    }
+
     fn watchDir(self: *Watcher, path: []const u8, interests: []const Interest, root: bool) Allocator.Error!Outcome {
         if (self.full) return .failed;
-        if (self.by_wd.count() >= max_watches) {
+        if (self.watchCount() >= max_watches) {
             try self.exhausted("watch cap of 16384 reached, further paths are not watched");
             return .failed;
         }
@@ -295,13 +398,17 @@ pub const Watcher = struct {
 
         // Roots follow symlinks (the user named them); anything found while
         // walking does not, so a link back up the tree cannot loop.
-        var m = event_mask | IN.ONLYDIR;
-        if (!root) m |= IN.DONT_FOLLOW;
-        const wd = os.inotifyAddWatch(self.fd, pz, m) catch |e| switch (e) {
+        const added = if (os.is_darwin) self.addDarwinDir(pz, root) else addInotify(self.fd, pz, root);
+        const wd = added catch |e| switch (e) {
             error.NoSpaceLeft => {
                 try self.exhausted("kernel watch limit reached (fs.inotify.max_user_watches), further paths are not watched");
                 return .failed;
             },
+            error.TooManyOpenFiles => {
+                try self.exhausted("open file limit reached, further paths are not watched");
+                return .failed;
+            },
+            error.OutOfMemory => return error.OutOfMemory,
             error.NotDir => return .not_dir,
             error.FileNotFound => return .missing,
             else => return .failed,
@@ -329,8 +436,15 @@ pub const Watcher = struct {
                 if (have.eql(in)) break;
             } else try d.interests.append(self.gpa, in);
         }
+        if (os.is_darwin) try self.watchFiles(d);
         if (recursive) try self.walk(d, pz);
         return .ok;
+    }
+
+    fn addInotify(fd: os.Fd, pz: [:0]const u8, root: bool) !i32 {
+        var m = event_mask | IN.ONLYDIR;
+        if (!root) m |= IN.DONT_FOLLOW;
+        return os.inotifyAddWatch(fd, pz, m);
     }
 
     fn walk(self: *Watcher, d: *Dir, pz: [:0]const u8) Allocator.Error!void {
@@ -388,9 +502,234 @@ pub const Watcher = struct {
     }
 
     fn freeDir(self: *Watcher, d: *Dir) void {
+        if (os.is_darwin) {
+            var it = d.entries.iterator();
+            while (it.next()) |e| {
+                if (e.value_ptr.file) |id| self.dropFile(id);
+                self.gpa.free(e.key_ptr.*);
+            }
+            d.entries.deinit(self.gpa);
+            if (self.by_ident.get(d.ident)) |wd| {
+                if (self.by_wd.get(wd) == d) _ = self.by_ident.remove(d.ident);
+            }
+            if (d.fd >= 0) os.close(d.fd);
+        }
         d.interests.deinit(self.gpa);
         self.gpa.free(d.path);
         self.gpa.destroy(d);
+    }
+
+    // ------------------------------------------------------------ macOS
+
+    fn nextId(self: *Watcher) i32 {
+        const id = self.next_id;
+        // Wrapping past the top would take decades of churn; skipping zero
+        // and negatives keeps an id from ever looking like "none".
+        self.next_id = if (self.next_id == std.math.maxInt(i32)) 1 else self.next_id + 1;
+        return id;
+    }
+
+    /// The darwin half of `watchDir`: a directory's `wd`, created with its
+    /// snapshot when it is not already watched under another path.
+    fn addDarwinDir(self: *Watcher, pz: [:0]const u8, root: bool) !i32 {
+        const fd = try os.kq.openEventOnly(pz, true, root);
+        var keep = false;
+        defer if (!keep) os.close(fd);
+
+        const ident = os.kq.identity(fd) orelse return error.Unexpected;
+        if (self.by_ident.get(ident)) |wd| return wd;
+
+        const d = try self.gpa.create(Dir);
+        errdefer self.gpa.destroy(d);
+        d.* = .{ .path = try self.gpa.dupe(u8, pz), .fd = fd, .ident = ident };
+        errdefer self.gpa.free(d.path);
+
+        const wd = self.nextId();
+        try self.by_wd.ensureUnusedCapacity(self.gpa, 1);
+        try self.by_ident.ensureUnusedCapacity(self.gpa, 1);
+        try os.kq.watch(self.fd, fd, dir_notes, @intCast(wd));
+        self.by_wd.putAssumeCapacity(wd, d);
+        self.by_ident.putAssumeCapacity(ident, wd);
+        keep = true;
+
+        // The first read records what is there without reporting any of it:
+        // a Session starting is not a change.
+        var scratch: std.ArrayList(Pending) = .empty;
+        defer self.freePending(&scratch);
+        self.rescan(d, &scratch) catch {};
+        return wd;
+    }
+
+    /// An event `rescan` found, held until the read is finished so that
+    /// handling it — which can add watches — never runs mid-iteration.
+    const Pending = struct { name: []u8, ev: u32 };
+
+    fn freePending(self: *Watcher, list: *std.ArrayList(Pending)) void {
+        for (list.items) |p| self.gpa.free(p.name);
+        list.deinit(self.gpa);
+    }
+
+    /// Re-reads a directory and diffs it against its snapshot, appending an
+    /// inotify-shaped event for each name that appeared, vanished, or now
+    /// points at a different inode.
+    fn rescan(self: *Watcher, d: *Dir, out: *std.ArrayList(Pending)) !void {
+        var vit = d.entries.valueIterator();
+        while (vit.next()) |e| e.seen = false;
+
+        var it = try os.DirIter.openIn(d.fd, ".");
+        defer it.close();
+        while (it.nextEntry()) |e| {
+            if (std.mem.eql(u8, e.name, ".") or std.mem.eql(u8, e.name, "..")) continue;
+            if (d.entries.getPtr(e.name)) |have| {
+                have.seen = true;
+                if (have.ino == e.ino and have.is_dir == e.is_dir) continue;
+                // Replaced under the same name: a rename-over save. The old
+                // file's watch is on an inode that no longer has this name.
+                if (have.file) |id| self.dropFile(id);
+                have.* = .{ .ino = e.ino, .is_dir = e.is_dir };
+                try self.queue(out, e.name, Ev.change | Ev.created | (if (e.is_dir) Ev.dir else 0));
+                continue;
+            }
+            // Freed only if the map never took it: once it is in, the map owns
+            // it, and an error further down must not free it out from under.
+            const key = try self.gpa.dupe(u8, e.name);
+            d.entries.put(self.gpa, key, .{ .ino = e.ino, .is_dir = e.is_dir }) catch |err| {
+                self.gpa.free(key);
+                return err;
+            };
+            try self.queue(out, e.name, Ev.change | Ev.created | (if (e.is_dir) Ev.dir else 0));
+        }
+
+        // Whatever the read did not visit is gone.
+        var gone: std.ArrayList([]const u8) = .empty;
+        defer gone.deinit(self.gpa);
+        var eit = d.entries.iterator();
+        while (eit.next()) |e| {
+            if (!e.value_ptr.seen) try gone.append(self.gpa, e.key_ptr.*);
+        }
+        for (gone.items) |name| {
+            try self.queue(out, name, Ev.change);
+            const kv = d.entries.fetchRemove(name).?;
+            if (kv.value.file) |id| self.dropFile(id);
+            self.gpa.free(kv.key);
+        }
+    }
+
+    fn queue(self: *Watcher, out: *std.ArrayList(Pending), name: []const u8, ev: u32) !void {
+        const copy = try self.gpa.dupe(u8, name);
+        errdefer self.gpa.free(copy);
+        try out.append(self.gpa, .{ .name = copy, .ev = ev });
+    }
+
+    /// Whether any of a directory's interests would report a change to the
+    /// file `name` — which is exactly when it is worth a descriptor.
+    fn wantsFile(self: *const Watcher, d: *const Dir, name: []const u8) bool {
+        for (d.interests.items) |in| {
+            if (self.ignored(in.target, name)) continue;
+            if (in.file) |f| if (!std.mem.eql(u8, f, name)) continue;
+            return true;
+        }
+        return false;
+    }
+
+    /// Gives every wanted file in `d` a watch of its own, if it lacks one.
+    fn watchFiles(self: *Watcher, d: *Dir) Allocator.Error!void {
+        var it = d.entries.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.is_dir or e.value_ptr.file != null) continue;
+            if (!self.wantsFile(d, e.key_ptr.*)) continue;
+            if (self.full) return;
+            if (self.watchCount() >= max_watches) {
+                return self.exhausted("watch cap of 16384 reached, further paths are not watched");
+            }
+            e.value_ptr.file = self.addFile(d, e.key_ptr.*) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.TooManyOpenFiles => {
+                    return self.exhausted("open file limit reached, further paths are not watched");
+                },
+                // Gone already, or not ours to read: the directory's own watch
+                // still sees it come and go.
+                else => null,
+            };
+        }
+    }
+
+    fn addFile(self: *Watcher, d: *const Dir, name: []const u8) !i32 {
+        const path = try std.fmt.allocPrintSentinel(self.gpa, "{s}/{s}", .{ d.path, name }, 0);
+        defer self.gpa.free(path);
+        // Not followed: a symlink's own changes are its directory's to report.
+        const fd = try os.kq.openEventOnly(path, false, false);
+        errdefer os.close(fd);
+        const owned = try self.gpa.dupe(u8, name);
+        errdefer self.gpa.free(owned);
+        const wd = self.by_ident.get(d.ident) orelse return error.Unexpected;
+        const id = self.nextId();
+        try self.files.ensureUnusedCapacity(self.gpa, 1);
+        try os.kq.watch(self.fd, fd, file_notes, @intCast(id));
+        self.files.putAssumeCapacity(id, .{ .fd = fd, .dir = wd, .name = owned });
+        return id;
+    }
+
+    fn dropFile(self: *Watcher, id: i32) void {
+        const kv = self.files.fetchRemove(id) orelse return;
+        os.close(kv.value.fd);
+        self.gpa.free(kv.value.name);
+    }
+
+    fn onKevents(self: *Watcher, now_ms: u64) void {
+        var evs: [64]os.kq.Kevent = undefined;
+        var rounds: usize = 0;
+        while (rounds < 64) : (rounds += 1) {
+            const n = os.kq.drain(self.fd, &evs);
+            if (n == 0) return;
+            for (evs[0..n]) |ev| self.onKevent(@intCast(ev.udata), ev.fflags, now_ms);
+            if (n < evs.len) return;
+        }
+    }
+
+    fn onKevent(self: *Watcher, id: i32, fflags: u32, now_ms: u64) void {
+        if (self.by_wd.get(id)) |d| {
+            if (fflags & (NOTE.DELETE | NOTE.REVOKE) != 0) {
+                self.handle(id, Ev.gone, null, now_ms);
+                return;
+            }
+            // Moved: the descriptor followed it, and the path that later
+            // subdirectories are joined to has to follow too.
+            if (fflags & NOTE.RENAME != 0) self.refreshPath(d);
+            if (fflags & NOTE.WRITE == 0) return;
+
+            var pending: std.ArrayList(Pending) = .empty;
+            defer self.freePending(&pending);
+            self.rescan(d, &pending) catch {
+                // Out of memory mid-read: the change itself must not be lost.
+                for (d.interests.items) |in| self.touch(in.target, now_ms);
+            };
+            for (pending.items) |p| self.handle(id, p.ev, p.name, now_ms);
+            // `handle` can have freed nothing here (no `gone` was queued), so
+            // `d` is still live; give any new files their watches.
+            if (self.by_wd.get(id)) |still| self.watchFiles(still) catch {};
+            return;
+        }
+        const f = self.files.get(id) orelse return; // a watch dropped earlier in this batch
+        if (fflags & (NOTE.WRITE | NOTE.EXTEND) != 0) self.handle(f.dir, Ev.change, f.name, now_ms);
+        if (fflags & (NOTE.DELETE | NOTE.RENAME | NOTE.REVOKE) != 0) {
+            // The name's next inode, if it gets one, is found by the
+            // directory's re-read; this watch is on one that has left.
+            if (self.by_wd.get(f.dir)) |d| {
+                if (d.entries.getPtr(f.name)) |e| {
+                    if (e.file == id) e.file = null;
+                }
+            }
+            self.dropFile(id);
+        }
+    }
+
+    fn refreshPath(self: *Watcher, d: *Dir) void {
+        var buf: [1024]u8 = undefined;
+        const now = os.kq.pathOf(d.fd, &buf) orelse return;
+        const fresh = self.gpa.dupe(u8, now) catch return;
+        self.gpa.free(d.path);
+        d.path = fresh;
     }
 };
 
@@ -610,7 +949,7 @@ test "a file target ignores its siblings and survives a rename-over" {
     defer testing.allocator.free(fz);
     const tz = try testing.allocator.dupeSentinel(u8, to, 0);
     defer testing.allocator.free(tz);
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.rename(fz, tz)));
+    try os.rename(fz, tz);
     try pump(&w, 500);
     try testing.expectEqual(@as(?u32, 0), w.takeDue(2000));
 }

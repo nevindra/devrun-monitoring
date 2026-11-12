@@ -15,15 +15,14 @@ const os = @import("os.zig");
 const supervisor = @import("supervisor.zig");
 
 const Supervisor = supervisor.Supervisor;
-const linux = os.linux;
 
 /// A request is one line and a reply fits in a few KB — `status` for a
 /// hundred Workers is still only a few thousand bytes.
 const max_request = 512;
 const max_reply = 32 << 10;
 
-fn sockaddrUn(path: [:0]const u8) !linux.sockaddr.un {
-    var addr = linux.sockaddr.un{ .family = linux.AF.UNIX, .path = undefined };
+fn sockaddrUn(path: [:0]const u8) !os.sockaddr.un {
+    var addr = os.sockaddr.un{ .family = os.AF.UNIX, .path = undefined };
     if (path.len >= addr.path.len) return error.NameTooLong;
     @memset(&addr.path, 0);
     @memcpy(addr.path[0..path.len], path);
@@ -58,7 +57,7 @@ pub const Server = struct {
         // did not get to clean up.
         os.unlink(path.ptr);
 
-        const fd = try os.socket(linux.AF.UNIX, linux.SOCK.STREAM, 0);
+        const fd = try os.socket(os.AF.UNIX, os.SOCK.STREAM, 0);
         errdefer os.close(fd);
         os.setNonblock(fd, true);
 
@@ -70,7 +69,7 @@ pub const Server = struct {
 
     /// Whether something is still accepting on this path.
     fn isLive(path: [:0]const u8) bool {
-        const fd = os.socket(linux.AF.UNIX, linux.SOCK.STREAM, 0) catch return false;
+        const fd = os.socket(os.AF.UNIX, os.SOCK.STREAM, 0) catch return false;
         defer os.close(fd);
         const addr = sockaddrUn(path) catch return false;
         os.connectUn(fd, &addr) catch return false;
@@ -288,7 +287,7 @@ fn samples(sup: *Supervisor, w: *std.Io.Writer) void {
 /// one-shot CLI with nothing else to do — the event loop's rules do not apply
 /// on this side.
 pub fn ask(path: [:0]const u8, line: []const u8, buf: []u8) ![]const u8 {
-    const fd = try os.socket(linux.AF.UNIX, linux.SOCK.STREAM, 0);
+    const fd = try os.socket(os.AF.UNIX, os.SOCK.STREAM, 0);
     defer os.close(fd);
 
     const addr = try sockaddrUn(path);
